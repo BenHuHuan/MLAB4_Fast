@@ -701,7 +701,7 @@ def get_optimal_batch_sim_threads(
 
 def get_cold_path_worker_count(max_cap: int = 16) -> int:
     """Determine optimal thread count for GIL-releasing cold-path I/O, SHA-256, and MuJoCo forward."""
-    env_override = os.environ.get("STABLE_MIMIC_CPU_IO_WORKERS")
+    env_override = os.environ.get("MJLAB_CPU_IO_WORKERS")
     if env_override is not None:
         try:
             return max(1, int(env_override))

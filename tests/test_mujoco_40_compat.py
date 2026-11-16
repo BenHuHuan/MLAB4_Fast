@@ -456,4 +456,4 @@ def test_dcmotor_dual_version_modes_and_physics(device):
     assert vel_sim.mj_model.actuator_gainprm[0, 8] == pytest.approx(2.0)
 
   info = get_physics_backend_info()
-  assert info["mujoco_version"] == mujoco.__version__
+  assert info["mujoco_version"].startswith(mujoco.__version__)

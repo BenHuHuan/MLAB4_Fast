@@ -46,13 +46,37 @@ from typing import Any, Iterator, Sequence
 
 import torch
 
-from src.supermimic.checkpoint_io import atomic_torch_save
 from .cpu_runtime import (
     confine_process_threads,
     get_worker_cpu_ids,
     get_worker_io_cpu_ids,
     pin_current_thread,
 )
+
+
+def atomic_torch_save(
+    payload: Any,
+    path: str | Path,
+    *,
+    stream_cuda: bool = False,
+) -> Path:
+    """Atomically write a PyTorch checkpoint via a sibling temporary file + ``os.replace``."""
+    _ = stream_cuda
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, dst)
+        return dst
+    except BaseException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 try:
     from tensorboard.compat.proto import event_pb2 as _tb_event_pb2
@@ -219,72 +243,22 @@ def snapshot_state_to_cpu(state: Any) -> Any:
 
 def build_cpu_onnx_export_template(runner: Any) -> dict[str, Any] | None:
     """Create a zero-CUDA-allocation CPU shell + export kwargs for ``runner``'s actor."""
-    policy = getattr(getattr(runner, "alg", None), "policy", None)
-    if policy is None or not hasattr(runner, "export_policy_to_onnx"):
+    alg = getattr(runner, "alg", None)
+    if alg is None or not hasattr(alg, "get_policy") or not hasattr(runner, "export_policy_to_onnx"):
         return None
-
-    moe_routing = getattr(policy, "moe_routing", None)
-    obs_norm = getattr(runner, "obs_normalizer", None)
-
-    def _cpu_deepcopy(module: torch.nn.Module) -> torch.nn.Module:
-        memo: dict[int, Any] = {}
-        dist_obj = getattr(module, "distribution", None)
-        if dist_obj is not None:
-            memo[id(dist_obj)] = None
-        for sub in module.modules():
-            for p in sub._parameters.values():
-                if p is not None and id(p) not in memo:
-                    memo[id(p)] = torch.nn.Parameter(
-                        torch.empty(p.shape, dtype=p.dtype, device="cpu"),
-                        requires_grad=False,
-                    )
-            for b in sub._buffers.values():
-                if b is not None and id(b) not in memo:
-                    memo[id(b)] = torch.empty(b.shape, dtype=b.dtype, device="cpu")
-            for k, v in sub.__dict__.items():
-                if k in ("_parameters", "_buffers", "_modules", "distribution"):
-                    continue
-                if isinstance(v, torch.Tensor) and id(v) not in memo:
-                    memo[id(v)] = v.detach().to("cpu")
-        cloned = copy.deepcopy(module, memo)
-        return cloned.cpu().eval()
-
-    # SdkRecoveryRunner dynamic_blend special contract
-    if moe_routing == "dynamic_blend" and type(runner).__name__ != "StableMimicOnPolicyRunner":
-        from src.tasks.stable_mimic.sdk_transfer.runner import DynamicMoEExport
-
-        cpu_policy = type(policy)(884, 1428, 29, moe_routing="dynamic_blend").cpu().eval()
-        cpu_norm = _cpu_deepcopy(obs_norm) if obs_norm is not None else torch.nn.Identity()
-        export_mod = DynamicMoEExport(cpu_policy, cpu_norm).cpu().eval()
-        buf = io.BytesIO()
-        torch.save(export_mod, buf)
-        return {
-            "kind": "dynamic_blend",
-            "shell_bytes": buf.getvalue(),
-            "in_features": 884,
-            "opset_version": 18,
-        }
-
-    # Standard StableMimic _ExportedActor contract
-    if hasattr(policy, "tracking_expert"):
-        from src.tasks.stable_mimic.rl.runner import _ExportedActor
-
-        cpu_policy = _cpu_deepcopy(policy)
-        if hasattr(cpu_policy, "configure_max_optimizations"):
-            cpu_policy.configure_max_optimizations(False)
-        cpu_norm = _cpu_deepcopy(obs_norm) if obs_norm is not None else torch.nn.Identity()
-        export_mod = _ExportedActor(cpu_policy, cpu_norm).cpu().eval()
-        in_features = int(policy.tracking_expert[0].in_features)
-        buf = io.BytesIO()
-        torch.save(export_mod, buf)
-        return {
-            "kind": "exported_actor",
-            "shell_bytes": buf.getvalue(),
-            "in_features": in_features,
-            "opset_version": 18,
-        }
-
-    return None
+    policy = alg.get_policy()
+    if policy is None or not hasattr(policy, "as_onnx"):
+        return None
+    onnx_model = policy.as_onnx(verbose=False)
+    onnx_model.to("cpu")
+    onnx_model.eval()
+    buf = io.BytesIO()
+    torch.save(onnx_model, buf)
+    return {
+        "kind": "rsl_rl_as_onnx",
+        "shell_bytes": buf.getvalue(),
+        "opset_version": 18,
+    }
 
 
 def _export_onnx_atomic_in_worker(
@@ -305,9 +279,11 @@ def _export_onnx_atomic_in_worker(
             weights_only=False,
         ).eval()
     export_mod = shell_cache[kind]
-    export_mod.policy.load_state_dict(saved_dict["model_state_dict"])
-    if "obs_norm_state_dict" in saved_dict and hasattr(export_mod.normalizer, "load_state_dict"):
-        export_mod.normalizer.load_state_dict(saved_dict["obs_norm_state_dict"])
+    state_dict = saved_dict.get("actor_state_dict") or saved_dict.get("model_state_dict")
+    if isinstance(state_dict, dict):
+        target = getattr(export_mod, "actor", getattr(export_mod, "policy", export_mod))
+        if hasattr(target, "load_state_dict"):
+            target.load_state_dict(state_dict, strict=False)
     export_mod.eval()
 
     out_dir = Path(onnx_dir)
@@ -317,35 +293,19 @@ def _export_onnx_atomic_in_worker(
     os.close(fd)
     tmp_path = Path(tmp_name)
     try:
-        if kind == "dynamic_blend":
-            dummy_inputs: Any = (
-                torch.zeros(1, 884),
-                torch.zeros(1, 2),
-                torch.ones(1, 1, dtype=torch.bool),
-            )
-            torch.onnx.export(
-                export_mod,
-                dummy_inputs,
-                str(tmp_path),
-                input_names=["obs", "router_state", "reset"],
-                output_names=["actions", "next_router_state", "weights"],
-                opset_version=int(template.get("opset_version", 18)),
-                external_data=False,
-                dynamo=False,
-            )
-        else:
-            in_features = int(template["in_features"])
-            torch.onnx.export(
-                export_mod,
-                torch.zeros(1, in_features),
-                str(tmp_path),
-                opset_version=int(template.get("opset_version", 18)),
-                input_names=["obs"],
-                output_names=["actions"],
-                dynamic_axes={"obs": {0: "batch"}, "actions": {0: "batch"}},
-                external_data=False,
-                dynamo=False,
-            )
+        torch.onnx.export(
+            export_mod,
+            export_mod.get_dummy_inputs(),  # type: ignore[operator]
+            str(tmp_path),
+            export_params=True,
+            opset_version=int(template.get("opset_version", 18)),
+            verbose=False,
+            input_names=export_mod.input_names,  # type: ignore[arg-type]
+            output_names=export_mod.output_names,  # type: ignore[arg-type]
+            dynamic_axes={},
+            external_data=False,
+            dynamo=False,
+        )
         tmp_path.replace(final_path)
         return str(final_path)
     except BaseException:

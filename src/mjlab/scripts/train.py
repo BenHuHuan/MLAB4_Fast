@@ -22,6 +22,7 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from mjlab.scripts._cli import maybe_print_top_level_help
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.utils.async_io import prewarm_async_checkpoint_worker
 from mjlab.utils.cpu_runtime import apply_cpu_execution_plan, partition_server_cpus
 from mjlab.utils.gpu import select_gpus
 from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_path
@@ -91,6 +92,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       driver_physical_cores=cfg.cpu_driver_cores,
     )
     apply_cpu_execution_plan(plan)
+    if rank == 0:
+      prewarm_async_checkpoint_worker(worker_cpu_ids=plan.worker_io_cpu_ids)
 
   cfg.agent.seed = seed
   cfg.env.seed = seed

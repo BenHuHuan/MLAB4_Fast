@@ -26,6 +26,7 @@ from mjlab.actuator import (
   DcMotorPhysicalParams,
 )
 from mjlab.actuator.actuator import TransmissionType
+from mjlab.actuator.builtin_actuator import _DCMOTOR_USES_CTRLSPEC
 from mjlab.entity import Entity, EntityArticulationInfoCfg, EntityCfg
 from mjlab.envs.mdp import dr
 from mjlab.managers.scene_entity_config import SceneEntityCfg
@@ -117,7 +118,10 @@ def test_kr_packed_into_gainprm(device):
     assert m.actuator_gainprm[i, 4] == pytest.approx(5.0)  # kp
     assert m.actuator_gainprm[i, 6] == pytest.approx(0.5)  # kd
     assert m.actuator_gainprm[i, 7] == pytest.approx(24.0)  # Vmax
-    assert m.actuator_gainprm[i, 8] == pytest.approx(1.0)  # input_mode=position
+    if _DCMOTOR_USES_CTRLSPEC:
+      assert m.actuator_ctrlspec[i] == int(mujoco.mjtCtrlInput.mjINPUT_POS)
+    else:
+      assert m.actuator_gainprm[i, 8] == pytest.approx(1.0)  # input_mode=position
     assert m.actuator_gaintype[i] == mujoco.mjtGain.mjGAIN_DCMOTOR
     assert m.actuator_biastype[i] == mujoco.mjtBias.mjBIAS_DCMOTOR
     # No activation state: ki=0, no inductance, no thermal/lugre/slew.
@@ -198,7 +202,7 @@ def test_position_mode_pid_at_rest(device):
   pos = torch.tensor([[0.1, -0.05]], device=device)
   _drive(entity, sim, device, pos_target=pos)
   v_adr = entity.indexing.joint_v_adr
-  expected = K * 5.0 * pos[0] / R
+  expected = 5.0 * pos[0] if _DCMOTOR_USES_CTRLSPEC else K * 5.0 * pos[0] / R
   assert torch.allclose(sim.data.qfrc_actuator[0, v_adr], expected, atol=1e-4)
 
 
@@ -219,19 +223,26 @@ def test_position_mode_voltage_clamp(device):
 
 
 def test_velocity_mode_pid(device):
-  """P-only velocity tracking: tau = K * kp * (target - qdot) / R."""
-  entity, sim = initialize_entity(
-    _make_entity(mode=DcMotorInputMode.VELOCITY, damping=0.0, voltage_limit=1000.0),
-    device,
-  )
+  """P-only velocity tracking: tau = kd*(target - qdot) in 4.0 ctrlspec torque space, else K*(kp*(target-qdot) - K*qdot)/R."""
+  if _DCMOTOR_USES_CTRLSPEC:
+    entity, sim = initialize_entity(
+      _make_entity(mode=DcMotorInputMode.VELOCITY, stiffness=0.0, damping=5.0, voltage_limit=1000.0),
+      device,
+    )
+  else:
+    entity, sim = initialize_entity(
+      _make_entity(mode=DcMotorInputMode.VELOCITY, damping=0.0, voltage_limit=1000.0),
+      device,
+    )
   qd0 = torch.tensor([[1.0, 0.0]], device=device)
   vel_target = torch.tensor([[3.0, 0.0]], device=device)
   _drive(entity, sim, device, vel_target=vel_target, qd0=qd0)
   v_adr = entity.indexing.joint_v_adr
-  # back-EMF subtracts K*omega; this is folded into the dcmotor bias.
-  # voltage = kp*(target - qdot); tau = K*(voltage - K*omega)/R.
-  voltage = 5.0 * (vel_target[0] - qd0[0])
-  expected = K * (voltage - K * qd0[0]) / R
+  if _DCMOTOR_USES_CTRLSPEC:
+    expected = 5.0 * (vel_target[0] - qd0[0])
+  else:
+    voltage = 5.0 * (vel_target[0] - qd0[0])
+    expected = K * (voltage - K * qd0[0]) / R
   assert torch.allclose(sim.data.qfrc_actuator[0, v_adr], expected, atol=1e-4)
 
 
@@ -363,8 +374,20 @@ def test_integral_gain_ramps_torque(device):
 
 
 def test_slew_rate_limits_voltage(device):
-  """``slew_rate`` rate-limits ``ctrl``: after one step, effective voltage
+  """``slew_rate`` rate-limits ``ctrl``: after one step, effective output
   is far below the requested input."""
+  if _DCMOTOR_USES_CTRLSPEC:
+    base = dict(
+      mode=DcMotorInputMode.POSITION, stiffness=5.0, damping=0.0, voltage_limit=1000.0
+    )
+    ent_off, sim_off = _make_initialized(device, **base, slew_rate=0.0)
+    ent_on, sim_on = _make_initialized(device, **base, slew_rate=10.0)
+    P = torch.tensor([[100.0, 0.0]], device=device)
+    for sim, ent in ((sim_off, ent_off), (sim_on, ent_on)):
+      _step_n(ent, sim, device, n=1, pos_target=P)
+    assert _qfrc(ent_off, sim_off)[0] > 100.0 * _qfrc(ent_on, sim_on)[0]
+    return
+
   base = dict(
     mode=DcMotorInputMode.VOLTAGE, stiffness=0.0, damping=0.0, voltage_limit=0.0
   )
@@ -649,5 +672,9 @@ def test_delay_position_mode(device):
 
   v_adr = entity.indexing.joint_v_adr
   # With lag=2 and three writes, the effective target is targets[0].
-  expected = K * 10.0 * targets[0][0] / R
+  expected = (
+    10.0 * targets[0][0]
+    if _DCMOTOR_USES_CTRLSPEC
+    else K * 10.0 * targets[0][0] / R
+  )
   assert torch.allclose(sim.data.qfrc_actuator[0, v_adr], expected, atol=1e-4)
