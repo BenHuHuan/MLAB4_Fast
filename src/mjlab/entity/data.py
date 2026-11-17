@@ -256,9 +256,7 @@ class EntityData:
     body_ids: Sequence[int] | slice | None = None,
     env_ids: torch.Tensor | slice | None = None,
   ) -> None:
-    body_sel = self._subselect(
-      self.indexing.body_sel, self.indexing.body_ids, body_ids
-    )
+    body_sel = self._subselect(self.indexing.body_sel, self.indexing.body_ids, body_ids)
     rows, cols = self._resolve_row_col(env_ids, body_sel)
     if force is not None:
       self.data.xfrc_applied[rows, cols, 0:3] = force
@@ -274,9 +272,7 @@ class EntityData:
     if not self.is_actuated:
       raise ValueError("Cannot write control for non-actuated entity.")
 
-    ctrl_sel = self._subselect(
-      self.indexing.ctrl_sel, self.indexing.ctrl_ids, ctrl_ids
-    )
+    ctrl_sel = self._subselect(self.indexing.ctrl_sel, self.indexing.ctrl_ids, ctrl_ids)
     rows, cols = self._resolve_row_col(env_ids, ctrl_sel)
     self.data.ctrl[rows, cols] = ctrl
 

@@ -44,10 +44,7 @@ def _configure_warp() -> None:
   # Keep warp verbose by default to show kernel compilation progress.
   # Override with MJLAB_WARP_QUIET=1 environment variable if needed.
   quiet = os.environ.get("MJLAB_WARP_QUIET", "0").lower() in ("1", "true", "yes")
-  if hasattr(wp, "LOG_WARNING") and hasattr(wp, "LOG_INFO"):
-    wp.config.log_level = wp.LOG_WARNING if quiet else wp.LOG_INFO
-  else:
-    wp.config.quiet = quiet
+  wp.config.log_level = wp.LOG_WARNING if quiet else wp.LOG_INFO
 
 
 def _import_registered_packages() -> None:

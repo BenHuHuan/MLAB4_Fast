@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -19,10 +20,17 @@ from mjlab.utils.async_io import (
 )
 from mjlab.utils.rollout_optimizations import FP32_EXACT_ENABLED, configure_fp32_exact
 
+if TYPE_CHECKING:
+  from mjlab.envs import ManagerBasedRlEnvCfg
+  from mjlab.rl import RslRlBaseRunnerCfg
+
 
 def test_mlab4_fast_defaults_permanently_enabled():
   assert FP32_EXACT_ENABLED is True
-  cfg = TrainConfig(env=SimpleNamespace(), agent=SimpleNamespace())
+  cfg = TrainConfig(
+    env=cast("ManagerBasedRlEnvCfg", SimpleNamespace()),
+    agent=cast("RslRlBaseRunnerCfg", SimpleNamespace()),
+  )
   assert cfg.mujoco_backend == "4.0"
   assert cfg.fp32_exact is True
   assert cfg.cpu_optimizations is True
@@ -123,6 +131,7 @@ def test_prewarm_and_single_event_step_batch(tmp_path: Path):
 
 
 def test_async_checkpoint_ping_pong_and_batched_writer(tmp_path: Path):
+  first_ms = 0.0
   worker = AsyncCheckpointWorker()
   try:
     t0 = time.perf_counter()
@@ -263,7 +272,7 @@ def test_run_train_enables_step_opts_and_respects_cpu_opt_false(
 
   import mjlab.scripts.train as train_mod
 
-  calls: dict[str, object] = {
+  calls: dict[str, int] = {
     "cpu_plan": 0,
     "prewarm": 0,
     "step_opts": 0,

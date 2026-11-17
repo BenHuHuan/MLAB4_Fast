@@ -1,6 +1,5 @@
 import functools
 import gc
-import inspect
 import math
 from dataclasses import dataclass, field
 from typing import Any
@@ -259,6 +258,7 @@ class ManagerBasedRlEnv:
     self._zero_sync_metrics: bool = False
     self._use_kinematic_post_step_forward: bool = False
     self._decimation_substep_runner: _DecimationSubstepGraph | None = None
+    self._fp32_step_opts_active: bool = False
 
   # Properties.
 
@@ -432,6 +432,8 @@ class ManagerBasedRlEnv:
       etc.) in the same function that writes state (``write_root_state_to_sim``,
       ``write_joint_state_to_sim``, etc.). See :ref:`faq` for details.
     """
+    if self._fp32_step_opts_active:
+      return self._step_fp32_optimized(action)
     if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
       pending_ids = self._manual_reset_pending.nonzero(as_tuple=False).squeeze(-1)
       raise RuntimeError(
@@ -655,7 +657,14 @@ class ManagerBasedRlEnv:
           forbidden_sensors.add(name)
         elif getattr(sensor, "cfg", None) is not None and getattr(
           sensor.cfg, "sensor_type", None
-        ) in ("accelerometer", "force", "torque", "touch", "framelinacc", "frameangacc"):
+        ) in (
+          "accelerometer",
+          "force",
+          "torque",
+          "touch",
+          "framelinacc",
+          "frameangacc",
+        ):
           forbidden_sensors.add(name)
 
     forbidden_attrs = {
@@ -686,15 +695,14 @@ class ManagerBasedRlEnv:
 
     def _callable_mentions_forbidden(fn: Any) -> bool:
       while isinstance(fn, functools.partial):
-        if _value_mentions_forbidden_sensor(fn.args) or _value_mentions_forbidden_sensor(
-          fn.keywords
-        ):
+        if _value_mentions_forbidden_sensor(
+          fn.args
+        ) or _value_mentions_forbidden_sensor(fn.keywords):
           return True
         fn = fn.func
       code = getattr(fn, "__code__", None)
       if code is None and callable(fn):
-        call_fn = getattr(fn, "__call__", None)
-        code = getattr(call_fn, "__code__", None)
+        code = getattr(fn.__call__, "__code__", None)
       if code is None:
         return True
       if forbidden_attrs.intersection(code.co_names):
@@ -774,10 +782,9 @@ class ManagerBasedRlEnv:
       has_resets = reset_env_ids.numel() > 0
 
     forward_fn = self.sim.forward
-    unwrapped_ok = (
-      getattr(forward_fn, "__func__", None) is type(self.sim).forward
-      or bool(getattr(forward_fn, "_is_capacity_check_wrapper", False))
-    )
+    unwrapped_ok = getattr(forward_fn, "__func__", None) is type(
+      self.sim
+    ).forward or bool(getattr(forward_fn, "_is_capacity_check_wrapper", False))
     if self._use_kinematic_post_step_forward and unwrapped_ok:
       self.sim.forward_kinematics_and_sensors()
     else:
@@ -829,15 +836,11 @@ class ManagerBasedRlEnv:
     else:
       self._decimation_substep_runner = None
 
-    if type(self).step is ManagerBasedRlEnv.step:
-      if (
-        self._zero_sync_metrics
-        or self._use_kinematic_post_step_forward
-        or self._decimation_substep_runner is not None
-      ):
-        self.step = self._step_fp32_optimized  # type: ignore[method-assign]
-      elif "step" in self.__dict__:
-        del self.__dict__["step"]
+    self._fp32_step_opts_active = type(self).step is ManagerBasedRlEnv.step and (
+      self._zero_sync_metrics
+      or self._use_kinematic_post_step_forward
+      or self._decimation_substep_runner is not None
+    )
 
     return {
       "zero_sync_metrics": self._zero_sync_metrics,

@@ -129,9 +129,7 @@ class CommandTerm(ManagerTermBase):
     if env_ids is None:
       self.time_left -= dt
       if zero_sync and self.cfg.resampling_time_range[0] > 0.0:
-        max_dt = (
-          float(self._env.step_dt) if isinstance(dt, torch.Tensor) else float(dt)
-        )
+        max_dt = float(self._env.step_dt) if isinstance(dt, torch.Tensor) else float(dt)
         self._time_left_lower_bound -= max(max_dt, 0.0) + 1.0e-6
         if self._time_left_lower_bound <= 0.0:
           resample_env_ids = (self.time_left <= 0.0).nonzero().flatten()
@@ -176,9 +174,7 @@ class CommandTerm(ManagerTermBase):
       if len(env_ids) == self.num_envs:
         self._time_left_lower_bound = min_resample
       else:
-        self._time_left_lower_bound = min(
-          self._time_left_lower_bound, min_resample
-        )
+        self._time_left_lower_bound = min(self._time_left_lower_bound, min_resample)
       self._resample_command(env_ids)
       self.command_counter[env_ids] += 1
 

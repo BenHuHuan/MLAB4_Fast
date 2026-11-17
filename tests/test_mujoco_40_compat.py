@@ -65,15 +65,10 @@ def test_parse_mujoco_backend_arg_variants():
   assert parse_mujoco_backend_arg(["--mujoco-backend=3.11"], {}) == "3.11"
   # Last flag wins when overridden on command line.
   assert (
-    parse_mujoco_backend_arg(
-      ["--mujoco-backend", "3.11", "--mj4"], {}
-    )
-    == "4.0-git"
+    parse_mujoco_backend_arg(["--mujoco-backend", "3.11", "--mj4"], {}) == "4.0-git"
   )
   assert (
-    parse_mujoco_backend_arg(
-      ["--mujoco-backend", "3.11", "--mujoco-backend=4.0"], {}
-    )
+    parse_mujoco_backend_arg(["--mujoco-backend", "3.11", "--mujoco-backend=4.0"], {})
     == "4.0"
   )
   # Arguments after "--" separator are ignored.
@@ -317,7 +312,9 @@ def test_recompute_constants_emits_no_deprecation_warnings(device):
     sim.recompute_constants(RecomputeLevel.set_const_fixed)
     sim.recompute_constants(RecomputeLevel.set_const_0)
     sim.recompute_constants(RecomputeLevel.set_const)
-  dep_msgs = [str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)]
+  dep_msgs = [
+    str(w.message) for w in caught if issubclass(w.category, DeprecationWarning)
+  ]
   assert not dep_msgs, f"Unexpected DeprecationWarnings: {dep_msgs}"
 
 
@@ -362,9 +359,7 @@ def test_version_specific_sim_options_and_errors(device):
     with pytest.raises(NotImplementedError, match="noslip"):
       Simulation(
         num_envs=1,
-        cfg=SimulationCfg(
-          mujoco=MujocoCfg(integrator="discrete", noslip_iterations=2)
-        ),
+        cfg=SimulationCfg(mujoco=MujocoCfg(integrator="discrete", noslip_iterations=2)),
         model=mujoco.MjModel.from_xml_string(ROBOT_XML),
         device=device,
       )
@@ -412,7 +407,9 @@ def test_dcmotor_dual_version_modes_and_physics(device):
     damping=0.0,
     voltage_limit=1000.0,
   )
-  entity, sim = initialize_entity(create_entity_with_actuator(ROBOT_XML, pos_cfg), device)
+  entity, sim = initialize_entity(
+    create_entity_with_actuator(ROBOT_XML, pos_cfg), device
+  )
   zero = torch.zeros(1, 2, device=device)
   pos_target = torch.tensor([[0.1, -0.05]], device=device)
   entity.write_joint_state_to_sim(position=zero, velocity=zero)
@@ -441,7 +438,9 @@ def test_dcmotor_dual_version_modes_and_physics(device):
       damping=2.0,
       voltage_limit=24.0,
     )
-    _, vel_sim = initialize_entity(create_entity_with_actuator(ROBOT_XML, vel_cfg), device)
+    _, vel_sim = initialize_entity(
+      create_entity_with_actuator(ROBOT_XML, vel_cfg), device
+    )
     assert vel_sim.mj_model.actuator_ctrlspec[0] == int(mujoco.mjtCtrlInput.mjINPUT_VEL)
   else:
     vel_cfg = BuiltinDcMotorActuatorCfg(
@@ -452,7 +451,9 @@ def test_dcmotor_dual_version_modes_and_physics(device):
       damping=0.0,
       voltage_limit=24.0,
     )
-    _, vel_sim = initialize_entity(create_entity_with_actuator(ROBOT_XML, vel_cfg), device)
+    _, vel_sim = initialize_entity(
+      create_entity_with_actuator(ROBOT_XML, vel_cfg), device
+    )
     assert vel_sim.mj_model.actuator_gainprm[0, 8] == pytest.approx(2.0)
 
   info = get_physics_backend_info()

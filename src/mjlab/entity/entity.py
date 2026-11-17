@@ -64,16 +64,16 @@ class EntityIndexing:
   free_joint_v_adr: torch.Tensor
 
   # Contiguous slice selectors (fall back to tensor when non-contiguous).
-  body_sel: slice | torch.Tensor = slice(0, 0)
-  geom_sel: slice | torch.Tensor = slice(0, 0)
-  site_sel: slice | torch.Tensor = slice(0, 0)
-  tendon_sel: slice | torch.Tensor = slice(0, 0)
-  ctrl_sel: slice | torch.Tensor = slice(0, 0)
-  joint_q_sel: slice | torch.Tensor = slice(0, 0)
-  joint_v_sel: slice | torch.Tensor = slice(0, 0)
-  free_joint_q_sel: slice | torch.Tensor = slice(0, 0)
-  free_joint_v_sel: slice | torch.Tensor = slice(0, 0)
-  free_joint_quat_sel: slice | torch.Tensor = slice(0, 0)
+  body_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  geom_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  site_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  tendon_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  ctrl_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  joint_q_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  joint_v_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  free_joint_q_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  free_joint_v_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
+  free_joint_quat_sel: slice | torch.Tensor = field(default_factory=lambda: slice(0, 0))
 
   @property
   def root_body_id(self) -> int:

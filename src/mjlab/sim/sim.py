@@ -4,32 +4,12 @@ import gc
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import mujoco
 import mujoco_warp as mjwarp
 import torch
 import warp as wp
-
-try:
-  from mujoco_warp._src.forward import (
-    _actuator_velocity as _mjwarp_actuator_velocity,
-    _tendon_velocity as _mjwarp_tendon_velocity,
-  )
-except Exception:
-  _mjwarp_actuator_velocity = None
-  _mjwarp_tendon_velocity = None
-
-try:
-  from mujoco_warp._src.sensor import (
-    _sensor_pos as _mjwarp_sensor_pos,
-    _sensor_vel as _mjwarp_sensor_vel,
-  )
-  from mujoco_warp._src.smooth import subtree_vel as _mjwarp_subtree_vel
-except Exception:
-  _mjwarp_sensor_pos = None
-  _mjwarp_sensor_vel = None
-  _mjwarp_subtree_vel = None
 
 from mjlab.entity.variants import VARIANT_DEPENDENT_FIELDS, build_variant_model
 from mjlab.managers.event_manager import RecomputeLevel
@@ -37,7 +17,42 @@ from mjlab.sim.randomization import expand_model_fields
 from mjlab.sim.sim_data import TorchArray, WarpBridge
 from mjlab.utils.nan_guard import NanGuard, NanGuardCfg
 
+_mjwarp_actuator_velocity: Any = None
+_mjwarp_tendon_velocity: Any = None
+try:
+  from mujoco_warp._src.forward import (
+    _actuator_velocity as _mw_actuator_velocity,
+  )
+  from mujoco_warp._src.forward import (
+    _tendon_velocity as _mw_tendon_velocity,
+  )
+
+  _mjwarp_actuator_velocity = _mw_actuator_velocity
+  _mjwarp_tendon_velocity = _mw_tendon_velocity
+except Exception:
+  pass
+
+_mjwarp_sensor_pos: Any = None
+_mjwarp_sensor_vel: Any = None
+_mjwarp_subtree_vel: Any = None
+try:
+  from mujoco_warp._src.sensor import (
+    _sensor_pos as _mw_sensor_pos,
+  )
+  from mujoco_warp._src.sensor import (
+    _sensor_vel as _mw_sensor_vel,
+  )
+  from mujoco_warp._src.smooth import subtree_vel as _mw_subtree_vel
+
+  _mjwarp_sensor_pos = _mw_sensor_pos
+  _mjwarp_sensor_vel = _mw_sensor_vel
+  _mjwarp_subtree_vel = _mw_subtree_vel
+except Exception:
+  pass
+
 if TYPE_CHECKING:
+  from mujoco import MjModel as _MjModel
+
   from mjlab.entity.variants import VariantMetadata
   from mjlab.sensor.sensor_context import SensorContext
 
@@ -301,7 +316,7 @@ class SimulationCfg:
         "SimulationCfg.warn_overflow_flags."
       )
 
-  def apply_model(self, model: mujoco.MjModel) -> None:
+  def apply_model(self, model: _MjModel) -> None:
     """Apply ``MujocoCfg`` and ``SimulationCfg`` model-level flags prior to ``put_model``."""
     self.mujoco.apply(model)
     if self.multiccd is not None:
@@ -536,9 +551,7 @@ class Simulation:
     self._reset_mask_wp = wp.zeros(self.num_envs, dtype=bool)
     self._reset_mask = TorchArray(self._reset_mask_wp)
     with wp.ScopedDevice(self.wp_device):
-      self._empty_sensor_collision_wp = wp.empty(
-        (self.num_envs, 0, 8, 7), dtype=float
-      )
+      self._empty_sensor_collision_wp = wp.empty((self.num_envs, 0, 8, 7), dtype=float)
 
     self._model_bridge = WarpBridge(self._wp_model, nworld=self.num_envs)
     self._data_bridge = WarpBridge(self._wp_data)
@@ -755,20 +768,28 @@ class Simulation:
     if allow_unread_contact_sensors:
       nrange = int(getattr(m, "nrangefinder", 0))
       has_pos = (
-        nrange > 0
-        or int(getattr(getattr(m, "sensor_pos_adr", None), "size", 0)) > 0
+        nrange > 0 or int(getattr(getattr(m, "sensor_pos_adr", None), "size", 0)) > 0
       )
       has_vel = int(getattr(getattr(m, "sensor_vel_adr", None), "size", 0)) > 0
       c_pos = int(getattr(getattr(m, "sensor_contact_pos_adr", None), "size", 0))
       c_vel = int(getattr(getattr(m, "sensor_contact_vel_adr", None), "size", 0))
-      if has_pos and c_pos > 0 and (
-        not _IS_MUJOCO_4 or _mjwarp_sensor_pos is None or nrange > 0
+      if (
+        has_pos
+        and c_pos > 0
+        and (not _IS_MUJOCO_4 or _mjwarp_sensor_pos is None or nrange > 0)
       ):
         return False
-      if has_vel and c_vel > 0 and (
-        not _IS_MUJOCO_4
-        or _mjwarp_sensor_vel is None
-        or (bool(getattr(m, "sensor_subtree_vel", False)) and _mjwarp_subtree_vel is None)
+      if (
+        has_vel
+        and c_vel > 0
+        and (
+          not _IS_MUJOCO_4
+          or _mjwarp_sensor_vel is None
+          or (
+            bool(getattr(m, "sensor_subtree_vel", False))
+            and _mjwarp_subtree_vel is None
+          )
+        )
       ):
         return False
     cb = getattr(m, "callback", None)
@@ -892,7 +913,10 @@ class Simulation:
     nvel = int(getattr(getattr(m, "sensor_vel_adr", None), "size", 0))
     nlimitvel = int(getattr(getattr(m, "sensor_limitvel_adr", None), "size", 0))
     if _IS_MUJOCO_4 and nvel > 0 and nlimitvel == 0 and _mjwarp_sensor_vel is not None:
-      if bool(getattr(m, "sensor_subtree_vel", False)) and _mjwarp_subtree_vel is not None:
+      if (
+        bool(getattr(m, "sensor_subtree_vel", False))
+        and _mjwarp_subtree_vel is not None
+      ):
         _mjwarp_subtree_vel(m, d)
       wp.launch(
         _mjwarp_sensor_vel,

@@ -226,7 +226,9 @@ def test_velocity_mode_pid(device):
   """P-only velocity tracking: tau = kd*(target - qdot) in 4.0 ctrlspec torque space, else K*(kp*(target-qdot) - K*qdot)/R."""
   if _DCMOTOR_USES_CTRLSPEC:
     entity, sim = initialize_entity(
-      _make_entity(mode=DcMotorInputMode.VELOCITY, stiffness=0.0, damping=5.0, voltage_limit=1000.0),
+      _make_entity(
+        mode=DcMotorInputMode.VELOCITY, stiffness=0.0, damping=5.0, voltage_limit=1000.0
+      ),
       device,
     )
   else:
@@ -673,8 +675,6 @@ def test_delay_position_mode(device):
   v_adr = entity.indexing.joint_v_adr
   # With lag=2 and three writes, the effective target is targets[0].
   expected = (
-    10.0 * targets[0][0]
-    if _DCMOTOR_USES_CTRLSPEC
-    else K * 10.0 * targets[0][0] / R
+    10.0 * targets[0][0] if _DCMOTOR_USES_CTRLSPEC else K * 10.0 * targets[0][0] / R
   )
   assert torch.allclose(sim.data.qfrc_actuator[0, v_adr], expected, atol=1e-4)

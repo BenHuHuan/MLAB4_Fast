@@ -134,7 +134,8 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     pinned = 0
     if confinement:
       conf_info = apply_cpu_execution_plan(plan)
-      pinned = int(conf_info.get("pinned_existing_threads", 0))
+      raw_pinned = conf_info.get("pinned_existing_threads", 0)
+      pinned = raw_pinned if isinstance(raw_pinned, int) else 0
     if async_checkpoint and self._async_io_worker is None:
       self._async_io_worker = consume_prewarmed_async_worker(
         worker_cpu_ids=plan.worker_io_cpu_ids
