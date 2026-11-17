@@ -792,7 +792,10 @@ class AsyncCheckpointWorker:
               else:
                 slab[off : off + nbytes].copy_(src_u8)
           self._copy_stream.synchronize()
-          buf[:tensor_bytes] = memoryview(slab.numpy())[:tensor_bytes]
+          shm_u8 = torch.frombuffer(
+            buf, dtype=torch.uint8, count=tensor_bytes, offset=0
+          )
+          shm_u8.copy_(slab[:tensor_bytes])
         else:
           # Single-copy CPU fast path: write tensors directly into /dev/shm mmap!
           shm_u8 = torch.frombuffer(
