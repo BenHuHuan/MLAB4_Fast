@@ -44,14 +44,24 @@ def test_cpu_runtime_pcore_filtering():
   hybrid = cr.CpuTopology(
     allowed_cpus=tuple(range(9)),
     physical_groups=(
-      cr.CpuCoreGroup(package_id=0, core_id=0, numa_node=0, max_freq_khz=5200000, cpu_ids=(0, 1)),
-      cr.CpuCoreGroup(package_id=0, core_id=1, numa_node=0, max_freq_khz=5200000, cpu_ids=(2, 3)),
-      cr.CpuCoreGroup(package_id=0, core_id=2, numa_node=0, max_freq_khz=3800000, cpu_ids=(4,)),
-      cr.CpuCoreGroup(package_id=0, core_id=3, numa_node=0, max_freq_khz=3800000, cpu_ids=(5,)),
+      cr.CpuCoreGroup(
+        package_id=0, core_id=0, numa_node=0, max_freq_khz=5200000, cpu_ids=(0, 1)
+      ),
+      cr.CpuCoreGroup(
+        package_id=0, core_id=1, numa_node=0, max_freq_khz=5200000, cpu_ids=(2, 3)
+      ),
+      cr.CpuCoreGroup(
+        package_id=0, core_id=2, numa_node=0, max_freq_khz=3800000, cpu_ids=(4,)
+      ),
+      cr.CpuCoreGroup(
+        package_id=0, core_id=3, numa_node=0, max_freq_khz=3800000, cpu_ids=(5,)
+      ),
     ),
     numa_nodes=(0,),
   )
-  assert cr.get_performance_cpu_ids((0, 1, 2, 3, 4, 5), one_per_core=True, topology=hybrid) == (0, 2)
+  assert cr.get_performance_cpu_ids(
+    (0, 1, 2, 3, 4, 5), one_per_core=True, topology=hybrid
+  ) == (0, 2)
 
 
 def test_cpu_runtime_multi_ccd_isolation():
@@ -72,7 +82,9 @@ def test_cpu_runtime_multi_ccd_isolation():
     numa_nodes=(0,),
     llc_ids=(0, 1, 2, 3),
   )
-  plan = cr.partition_server_cpus(world_size=1, rank=0, topology=topo, driver_physical_cores=2)
+  plan = cr.partition_server_cpus(
+    world_size=1, rank=0, topology=topo, driver_physical_cores=2
+  )
   assert plan.driver_cpu_ids == (0, 1, 24, 25)
   assert set(plan.driver_cpu_ids).isdisjoint(plan.worker_cpu_ids)
   # Non-driver CCDs (CCD 1..3 = cores 6..23) are prioritized ahead of CCD 0 siblings.
@@ -115,7 +127,9 @@ def test_async_checkpoint_ping_pong_and_batched_writer(tmp_path: Path):
   try:
     t0 = time.perf_counter()
     for i in range(3):
-      worker.submit_save({"iter": i, "w": torch.full((32, 32), float(i + 1))}, tmp_path / f"m_{i}.pt")
+      worker.submit_save(
+        {"iter": i, "w": torch.full((32, 32), float(i + 1))}, tmp_path / f"m_{i}.pt"
+      )
       if i == 0:
         first_ms = (time.perf_counter() - t0) * 1000.0
     worker.flush()
@@ -147,3 +161,191 @@ def test_async_checkpoint_ping_pong_and_batched_writer(tmp_path: Path):
     assert len(recorded) == 5
   finally:
     w.close()
+
+
+def test_is_plain_tb_writer_skips_wandb_and_flushes_before_stop(tmp_path: Path):
+  from torch.utils.tensorboard import SummaryWriter
+
+  from mjlab.rl.runner import MjlabOnPolicyRunner, _is_plain_tb_writer
+
+  class _FakeWandbWriter(SummaryWriter):
+    def save_model(self, model_path: str, iter: int) -> None:
+      pass
+
+    def stop(self) -> None:
+      pass
+
+  tb = SummaryWriter(log_dir=str(tmp_path / "tb"))
+  wb = _FakeWandbWriter(log_dir=str(tmp_path / "wb"))
+  try:
+    assert _is_plain_tb_writer(tb) is True
+    assert _is_plain_tb_writer(wb) is False
+  finally:
+    tb.close()
+    wb.close()
+
+  events: list[str] = []
+
+  class _FakeLogger:
+    def __init__(self, writer):
+      self.writer = writer
+
+    def init_logging_writer(self) -> None:
+      pass
+
+    def log(self, *args, **kwargs) -> None:
+      pass
+
+    def stop_logging_writer(self) -> None:
+      events.append("stop")
+
+    def save_model(self, path: str, it: int) -> None:
+      events.append(f"upload:{it}")
+
+  dummy_runner = SimpleNamespace(
+    logger=_FakeLogger(wb),
+    cfg={"upload_model": True},
+    _async_io_worker=SimpleNamespace(
+      flush=lambda: events.append("flush"),
+      pop_completed_artifacts=lambda: ([("/tmp/m_1.pt", 1)], []),
+    ),
+  )
+  dummy_runner._active_writers = lambda: []
+  dummy_runner._drain_async_model_uploads = (
+    lambda: MjlabOnPolicyRunner._drain_async_model_uploads(dummy_runner)  # type: ignore[arg-type]
+  )
+  dummy_runner.flush_async_io = lambda: MjlabOnPolicyRunner.flush_async_io(
+    dummy_runner  # type: ignore[arg-type]
+  )
+  assert (
+    MjlabOnPolicyRunner._install_batched_logger_hooks(
+      dummy_runner,  # type: ignore[arg-type]
+      (),
+    )
+    is True
+  )
+  assert dummy_runner.logger.writer is wb
+
+  dummy_runner.logger.stop_logging_writer()
+  assert events == ["flush", "upload:1", "stop"]
+  assert getattr(dummy_runner.logger, "_mlab4_writer_stopped", False) is True
+  # Late drain after stop_logging_writer must not call save_model again.
+  dummy_runner._drain_async_model_uploads()
+  assert events == ["flush", "upload:1", "stop"]
+
+
+def test_matches_requested_backend_distinct_symlinked_venvs(tmp_path: Path):
+  import sys
+
+  from mjlab._backend_bootstrap import _matches_requested_backend
+
+  git_bin = tmp_path / ".venv-mj4-git" / "bin"
+  git_bin.mkdir(parents=True)
+  git_py = git_bin / "python"
+  git_py.symlink_to(sys.executable)
+
+  # Even when git_py points to the same underlying python binary, a different
+  # venv bin directory must trigger re-exec rather than returning True.
+  assert (
+    _matches_requested_backend(
+      "4.0-git",
+      "4.0",
+      environ={"MJLAB_MUJOCO4_GIT_PYTHON": str(git_py)},
+    )
+    is False
+  )
+
+
+def test_run_train_enables_step_opts_and_respects_cpu_opt_false(
+  monkeypatch, tmp_path: Path
+):
+  from dataclasses import dataclass, field
+
+  import mjlab.scripts.train as train_mod
+
+  calls: dict[str, object] = {
+    "cpu_plan": 0,
+    "prewarm": 0,
+    "step_opts": 0,
+    "runner_cpu_opts": 0,
+  }
+
+  @dataclass
+  class _FakeEnvCfg:
+    seed: int = 42
+    commands: dict = field(default_factory=dict)
+
+  @dataclass
+  class _FakeAgentCfg:
+    seed: int = 42
+    resume: bool = False
+    clip_actions: float | None = None
+    wandb_tags: tuple = ()
+    max_iterations: int = 1
+
+  class _FakeEnv:
+    def __init__(self, cfg, device, render_mode=None):
+      pass
+
+    def enable_fp32_step_optimizations(self):
+      calls["step_opts"] = int(calls["step_opts"]) + 1
+      return {}
+
+    def close(self):
+      pass
+
+  class _FakeRunner:
+    def __init__(self, env, agent_cfg, log_dir, device, **kwargs):
+      pass
+
+    def enable_cpu_optimizations(self, **kwargs):
+      calls["runner_cpu_opts"] = int(calls["runner_cpu_opts"]) + 1
+
+    def add_git_repo_to_log(self, path):
+      pass
+
+    def learn(self, **kwargs):
+      pass
+
+    def close_cpu_workers(self):
+      pass
+
+  monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+  monkeypatch.setattr(train_mod, "configure_torch_backends", lambda **kw: None)
+  monkeypatch.setattr(train_mod, "configure_fp32_exact", lambda cfg, enabled=True: {})
+  monkeypatch.setattr(
+    train_mod,
+    "partition_server_cpus",
+    lambda **kw: (
+      calls.__setitem__("cpu_plan", int(calls["cpu_plan"]) + 1)
+      or SimpleNamespace(worker_io_cpu_ids=())
+    ),
+  )
+  monkeypatch.setattr(train_mod, "apply_cpu_execution_plan", lambda plan: {})
+  monkeypatch.setattr(
+    train_mod,
+    "prewarm_async_checkpoint_worker",
+    lambda **kw: calls.__setitem__("prewarm", int(calls["prewarm"]) + 1),
+  )
+  monkeypatch.setattr(train_mod, "ManagerBasedRlEnv", _FakeEnv)
+  monkeypatch.setattr(
+    train_mod, "RslRlVecEnvWrapper", lambda env, clip_actions=None: env
+  )
+  monkeypatch.setattr(train_mod, "load_runner_cls", lambda task_id: _FakeRunner)
+  monkeypatch.setattr(train_mod, "dump_yaml", lambda *a, **kw: None)
+  monkeypatch.setattr(train_mod, "get_physics_backend_info", lambda b: {})
+  monkeypatch.setattr(train_mod, "add_wandb_tags", lambda tags: None)
+
+  cfg = train_mod.TrainConfig(
+    env=_FakeEnvCfg(),  # type: ignore[arg-type]
+    agent=_FakeAgentCfg(),  # type: ignore[arg-type]
+    fp32_exact=True,
+    cpu_optimizations=False,
+  )
+  run_dir = tmp_path / "run_off"
+  (run_dir / "params").mkdir(parents=True)
+  train_mod.run_train("Mjlab-Velocity-Flat-Unitree-G1", cfg, run_dir)
+  assert calls["step_opts"] == 1
+  assert calls["cpu_plan"] == 0
+  assert calls["prewarm"] == 0
+  assert calls["runner_cpu_opts"] == 0

@@ -8,8 +8,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from mjlab.rl.vecenv_wrapper import RslRlVecEnvWrapper
 from mjlab.utils.async_io import (
-  BatchedAsyncLogWriter,
   AsyncCheckpointWorker,
+  BatchedAsyncLogWriter,
   consume_prewarmed_async_worker,
 )
 from mjlab.utils.cpu_runtime import (
@@ -17,6 +17,16 @@ from mjlab.utils.cpu_runtime import (
   get_worker_io_cpu_ids,
   partition_server_cpus,
 )
+
+
+def _is_plain_tb_writer(writer: object) -> bool:
+  """Return True only for pure TensorBoard SummaryWriter instances."""
+  if not isinstance(writer, SummaryWriter) or isinstance(writer, BatchedAsyncLogWriter):
+    return False
+  name = type(writer).__name__
+  return (
+    "Wandb" not in name and "Neptune" not in name and not hasattr(writer, "save_model")
+  )
 
 
 class MjlabOnPolicyRunner(OnPolicyRunner):
@@ -51,11 +61,12 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     if logger is not None and not getattr(logger, "_mlab4_batched_hooked", False):
       orig_init = logger.init_logging_writer
       orig_log = logger.log
+      orig_stop = getattr(logger, "stop_logging_writer", None)
 
       def _wrapped_init() -> None:
         orig_init()
         w = getattr(logger, "writer", None)
-        if isinstance(w, SummaryWriter) and not isinstance(w, BatchedAsyncLogWriter):
+        if _is_plain_tb_writer(w):
           logger.writer = BatchedAsyncLogWriter(w, worker_cpu_ids=io_cpu_ids)
 
       def _wrapped_log(*args, **kwargs) -> None:
@@ -67,22 +78,35 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         else:
           orig_log(*args, **kwargs)
 
+      def _wrapped_stop() -> None:
+        self.flush_async_io()
+        logger._mlab4_writer_stopped = True
+        if orig_stop is not None:
+          orig_stop()
+
       logger.init_logging_writer = _wrapped_init
       logger.log = _wrapped_log
+      if orig_stop is not None:
+        logger.stop_logging_writer = _wrapped_stop
       logger._mlab4_batched_hooked = True
       w_now = getattr(logger, "writer", None)
-      if isinstance(w_now, SummaryWriter) and not isinstance(w_now, BatchedAsyncLogWriter):
+      if _is_plain_tb_writer(w_now):
         logger.writer = BatchedAsyncLogWriter(w_now, worker_cpu_ids=io_cpu_ids)
       return True
 
     writer = getattr(self, "writer", None)
-    if writer is not None and not isinstance(writer, BatchedAsyncLogWriter):
+    if _is_plain_tb_writer(writer):
       self.writer = BatchedAsyncLogWriter(writer, worker_cpu_ids=io_cpu_ids)
       return True
     return isinstance(writer, BatchedAsyncLogWriter)
 
   def _drain_async_model_uploads(self) -> None:
-    if self._async_io_worker is None or not self.cfg.get("upload_model", False):
+    logger = getattr(self, "logger", None)
+    if (
+      self._async_io_worker is None
+      or not self.cfg.get("upload_model", False)
+      or (logger is not None and getattr(logger, "_mlab4_writer_stopped", False))
+    ):
       return
     saves, _ = self._async_io_worker.pop_completed_artifacts()
     for ckpt_path, it in saves:

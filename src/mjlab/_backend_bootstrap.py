@@ -199,10 +199,15 @@ def _matches_requested_backend(
   except RuntimeError:
     return False
 
-  try:
-    same_exe = os.path.samefile(sys.executable, target)
-  except OSError:
-    same_exe = os.path.abspath(sys.executable) == os.path.abspath(target)
+  cur_bin = os.path.realpath(os.path.dirname(os.path.abspath(sys.executable)))
+  tgt_bin = os.path.realpath(os.path.dirname(os.path.abspath(target)))
+  if cur_bin == tgt_bin:
+    try:
+      same_exe = os.path.samefile(sys.executable, target)
+    except OSError:
+      same_exe = os.path.abspath(sys.executable) == os.path.abspath(target)
+  else:
+    same_exe = False
 
   if not same_exe:
     return False
