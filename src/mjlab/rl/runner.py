@@ -4,14 +4,29 @@ from pathlib import Path
 import torch
 from rsl_rl.env import VecEnv
 from rsl_rl.runners import OnPolicyRunner
+from torch.utils.tensorboard import SummaryWriter
 
 from mjlab.rl.vecenv_wrapper import RslRlVecEnvWrapper
-from mjlab.utils.async_io import AsyncBatchedScalarWriter, AsyncCheckpointWorker
+from mjlab.utils.async_io import (
+  AsyncCheckpointWorker,
+  BatchedAsyncLogWriter,
+  consume_prewarmed_async_worker,
+)
 from mjlab.utils.cpu_runtime import (
   apply_cpu_execution_plan,
-  get_worker_cpu_ids,
+  get_worker_io_cpu_ids,
   partition_server_cpus,
 )
+
+
+def _is_plain_tb_writer(writer: object) -> bool:
+  """Return True only for pure TensorBoard SummaryWriter instances."""
+  if not isinstance(writer, SummaryWriter) or isinstance(writer, BatchedAsyncLogWriter):
+    return False
+  name = type(writer).__name__
+  return (
+    "Wandb" not in name and "Neptune" not in name and not hasattr(writer, "save_model")
+  )
 
 
 class MjlabOnPolicyRunner(OnPolicyRunner):
@@ -38,6 +53,65 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     super().__init__(env, train_cfg, log_dir, device)
     self._async_io_worker: AsyncCheckpointWorker | None = None
     self._cpu_execution_plan = None
+    self._batched_logging_enabled: bool = False
+
+  def _install_batched_logger_hooks(self, io_cpu_ids: tuple[int, ...]) -> bool:
+    """Wrap TensorBoard SummaryWriter with single-Event protobuf coalescing."""
+    logger = getattr(self, "logger", None)
+    if logger is not None and not getattr(logger, "_mlab4_batched_hooked", False):
+      orig_init = logger.init_logging_writer
+      orig_log = logger.log
+      orig_stop = getattr(logger, "stop_logging_writer", None)
+
+      def _wrapped_init() -> None:
+        orig_init()
+        w = getattr(logger, "writer", None)
+        if _is_plain_tb_writer(w):
+          logger.writer = BatchedAsyncLogWriter(w, worker_cpu_ids=io_cpu_ids)
+
+      def _wrapped_log(*args, **kwargs) -> None:
+        self._drain_async_model_uploads()
+        w = getattr(logger, "writer", None)
+        if isinstance(w, BatchedAsyncLogWriter):
+          with w.step_batch():
+            orig_log(*args, **kwargs)
+        else:
+          orig_log(*args, **kwargs)
+
+      def _wrapped_stop() -> None:
+        self.flush_async_io()
+        logger._mlab4_writer_stopped = True
+        if orig_stop is not None:
+          orig_stop()
+
+      logger.init_logging_writer = _wrapped_init
+      logger.log = _wrapped_log
+      if orig_stop is not None:
+        logger.stop_logging_writer = _wrapped_stop
+      logger._mlab4_batched_hooked = True
+      w_now = getattr(logger, "writer", None)
+      if _is_plain_tb_writer(w_now):
+        logger.writer = BatchedAsyncLogWriter(w_now, worker_cpu_ids=io_cpu_ids)
+      return True
+
+    writer = getattr(self, "writer", None)
+    if _is_plain_tb_writer(writer):
+      self.writer = BatchedAsyncLogWriter(writer, worker_cpu_ids=io_cpu_ids)
+      return True
+    return isinstance(writer, BatchedAsyncLogWriter)
+
+  def _drain_async_model_uploads(self) -> None:
+    logger = getattr(self, "logger", None)
+    if (
+      self._async_io_worker is None
+      or not self.cfg.get("upload_model", False)
+      or (logger is not None and getattr(logger, "_mlab4_writer_stopped", False))
+    ):
+      return
+    saves, _ = self._async_io_worker.pop_completed_artifacts()
+    for ckpt_path, it in saves:
+      if ckpt_path:
+        self.logger.save_model(str(ckpt_path), int(it))
 
   def enable_cpu_optimizations(
     self,
@@ -47,7 +121,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     driver_physical_cores: int | None = None,
     batched_logging: bool = True,
   ) -> dict:
-    """Enable NUMA/P-core CPU isolation, Ping-Pong async checkpointing, and batched logging."""
+    """Enable NUMA/CCD/P-core CPU isolation, save_v2 async checkpointing, and batched logging."""
     plan = partition_server_cpus(
       world_size=getattr(self, "gpu_world_size", 1),
       rank=getattr(self, "gpu_global_rank", 0),
@@ -60,34 +134,56 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     pinned = 0
     if confinement:
       conf_info = apply_cpu_execution_plan(plan)
-      pinned = int(conf_info.get("pinned_existing_threads", 0))
+      raw_pinned = conf_info.get("pinned_existing_threads", 0)
+      pinned = raw_pinned if isinstance(raw_pinned, int) else 0
     if async_checkpoint and self._async_io_worker is None:
-      self._async_io_worker = AsyncCheckpointWorker(worker_cpu_ids=plan.worker_io_cpu_ids)
-    writer = getattr(self, "writer", None)
-    if batched_logging and writer is not None and not isinstance(writer, AsyncBatchedScalarWriter):
-      self.writer = AsyncBatchedScalarWriter(writer, worker_cpu_ids=get_worker_cpu_ids())
+      self._async_io_worker = consume_prewarmed_async_worker(
+        worker_cpu_ids=plan.worker_io_cpu_ids
+      ) or AsyncCheckpointWorker(worker_cpu_ids=plan.worker_io_cpu_ids)
+    io_cpus = plan.worker_io_cpu_ids or get_worker_io_cpu_ids()
+    if batched_logging:
+      self._batched_logging_enabled = self._install_batched_logger_hooks(io_cpus)
     return {
       **plan.to_dict(),
       "pinned_existing_threads": pinned,
       "async_checkpoint": self._async_io_worker is not None,
-      "batched_async_logging": isinstance(getattr(self, "writer", None), AsyncBatchedScalarWriter),
+      "batched_async_logging": self._batched_logging_enabled,
     }
+
+  def _active_writers(self) -> list:
+    out = []
+    w1 = getattr(self, "writer", None)
+    if w1 is not None:
+      out.append(w1)
+    logger = getattr(self, "logger", None)
+    w2 = getattr(logger, "writer", None) if logger is not None else None
+    if w2 is not None and w2 is not w1:
+      out.append(w2)
+    return out
 
   def flush_async_io(self) -> None:
     if self._async_io_worker is not None:
       self._async_io_worker.flush()
-    writer = getattr(self, "writer", None)
-    if writer is not None and hasattr(writer, "flush"):
-      writer.flush()
+      self._drain_async_model_uploads()
+    for w in self._active_writers():
+      if hasattr(w, "flush"):
+        w.flush()
 
   def close_cpu_workers(self) -> None:
     err = None
-    writer = getattr(self, "writer", None)
-    if writer is not None and hasattr(writer, "close"):
+    if self._async_io_worker is not None:
       try:
-        writer.close()
+        self._async_io_worker.flush()
+        self._drain_async_model_uploads()
       except Exception as exc:
         err = exc
+    for w in self._active_writers():
+      if hasattr(w, "close"):
+        try:
+          w.close()
+        except Exception as exc:
+          if err is None:
+            err = exc
     if self._async_io_worker is not None:
       try:
         self._async_io_worker.close()
@@ -145,13 +241,17 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     saved_dict["iter"] = self.current_learning_iteration
     saved_dict["infos"] = infos
     if self._async_io_worker is not None:
-      self._async_io_worker.submit_save(saved_dict, path, export_onnx=False)
+      self._drain_async_model_uploads()
+      self._async_io_worker.submit_save(
+        saved_dict,
+        path,
+        export_onnx=False,
+      )
+      self._drain_async_model_uploads()
     else:
       torch.save(saved_dict, path)
-    if self.cfg["upload_model"]:
-      if self._async_io_worker is not None:
-        self._async_io_worker.flush()
-      self.logger.save_model(path, self.current_learning_iteration)
+      if self.cfg["upload_model"]:
+        self.logger.save_model(path, self.current_learning_iteration)
 
   def load(
     self,

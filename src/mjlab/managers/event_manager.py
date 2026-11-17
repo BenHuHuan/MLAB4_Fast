@@ -282,9 +282,7 @@ class EventManager(ManagerBase):
             lower, upper = term_cfg.interval_range_s
             sampled_interval = torch.rand(1) * (upper - lower) + lower
             self._interval_term_time_left[index][:] = sampled_interval
-            self._interval_time_left_lower_bound[index] = float(
-              sampled_interval.item()
-            )
+            self._interval_time_left_lower_bound[index] = float(sampled_interval.item())
             term_cfg.func(self._env, None, **term_cfg.params)
             fired = True
         else:
@@ -307,9 +305,7 @@ class EventManager(ManagerBase):
             term_cfg.func(self._env, valid_env_ids, **term_cfg.params)
             fired = True
           if zero_sync:
-            self._interval_time_left_lower_bound[index] = float(
-              time_left.min().item()
-            )
+            self._interval_time_left_lower_bound[index] = float(time_left.min().item())
       elif mode == "step":
         term_cfg.func(self._env, None, **term_cfg.params)
         fired = True

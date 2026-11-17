@@ -74,8 +74,12 @@ class _FusedDelayGroup:
   per_env_phase: bool
   absorbed_actuators: list[Actuator] = field(default_factory=list)
   delay_buffer: DelayBuffer | None = field(default=None, init=False)
-  target_sel: slice | torch.Tensor = field(default=slice(0, 0), init=False)
-  ctrl_sel: slice | torch.Tensor = field(default=slice(0, 0), init=False)
+  target_sel: slice | torch.Tensor = field(
+    default_factory=lambda: slice(0, 0), init=False
+  )
+  ctrl_sel: slice | torch.Tensor = field(
+    default_factory=lambda: slice(0, 0), init=False
+  )
 
   def __post_init__(self) -> None:
     self.target_sel = _slice_or_ids(self.target_ids)

@@ -22,6 +22,7 @@ from mjlab.rl import MjlabOnPolicyRunner, RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from mjlab.scripts._cli import maybe_print_top_level_help
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
 from mjlab.tasks.tracking.mdp import MotionCommandCfg
+from mjlab.utils.async_io import prewarm_async_checkpoint_worker
 from mjlab.utils.cpu_runtime import apply_cpu_execution_plan, partition_server_cpus
 from mjlab.utils.gpu import select_gpus
 from mjlab.utils.os import dump_yaml, get_checkpoint_path, get_wandb_checkpoint_path
@@ -52,7 +53,7 @@ class TrainConfig:
   fp32_exact: bool = True
   """Permanently-enabled lossless IEEE FP32 rollout/physics acceleration (0.0 numerical drift)."""
   cpu_optimizations: bool = True
-  """NUMA/P-core CPU isolation + Ping-Pong async checkpointing + batched logging (auto-enabled with fp32_exact)."""
+  """NUMA/P-core CPU isolation + save_v2 async checkpointing + batched logging."""
   cpu_driver_cores: int | None = None
   """Optional explicit count of physical cores reserved for the CUDA/Warp driver thread."""
 
@@ -81,7 +82,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   configure_torch_backends(allow_tf32=not cfg.fp32_exact)
   if cfg.fp32_exact:
     configure_fp32_exact(cfg.env, enabled=True)
-  if cfg.cpu_optimizations or cfg.fp32_exact:
+  if cfg.cpu_optimizations:
     plan = partition_server_cpus(
       world_size=int(os.environ.get("WORLD_SIZE", "1")),
       rank=rank,
@@ -91,6 +92,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
       driver_physical_cores=cfg.cpu_driver_cores,
     )
     apply_cpu_execution_plan(plan)
+    if rank == 0:
+      prewarm_async_checkpoint_worker(worker_cpu_ids=plan.worker_io_cpu_ids)
 
   cfg.agent.seed = seed
   cfg.env.seed = seed
@@ -141,6 +144,8 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
   env = ManagerBasedRlEnv(
     cfg=cfg.env, device=device, render_mode="rgb_array" if cfg.video else None
   )
+  if cfg.fp32_exact and hasattr(env, "enable_fp32_step_optimizations"):
+    env.enable_fp32_step_optimizations()
 
   log_root_path = log_dir.parent  # Go up from specific run dir to experiment dir.
 
@@ -200,7 +205,7 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
     )
 
   runner = runner_cls(env, agent_cfg, str(log_dir), device, **runner_kwargs)
-  if (cfg.cpu_optimizations or cfg.fp32_exact) and hasattr(runner, "enable_cpu_optimizations"):
+  if cfg.cpu_optimizations and hasattr(runner, "enable_cpu_optimizations"):
     runner.enable_cpu_optimizations(
       async_checkpoint=True,
       confinement=True,

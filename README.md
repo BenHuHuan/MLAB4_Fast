@@ -19,7 +19,7 @@
 
 ## Installation (via `uv`)
 
-Requires [`uv`](https://docs.astral.sh/uv/) and Python `>=3.10,<3.14`.
+Requires [`uv`](https://docs.astral.sh/uv/) and Python `>=3.11,<3.14`.
 
 ### GPU (CUDA 12.8 / 13.x)
 

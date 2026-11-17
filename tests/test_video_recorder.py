@@ -1,11 +1,36 @@
 """Tests for video recording with mediapy."""
 
+import shutil
 from pathlib import Path
 from unittest.mock import Mock
 
+import imageio_ffmpeg
 import mediapy as media
 import numpy as np
 import torch
+
+if shutil.which("ffmpeg") is None:
+  media.set_ffmpeg(imageio_ffmpeg.get_ffmpeg_exe())
+
+_orig_run_ffmpeg = getattr(media, "_run_ffmpeg", None)
+if callable(_orig_run_ffmpeg) and not getattr(
+  _orig_run_ffmpeg, "_fps_mode_patched", False
+):
+  _base_run_ffmpeg = _orig_run_ffmpeg
+
+  def _compat_run_ffmpeg(ffmpeg_args, *args, **kwargs):
+    mapped = []
+    it = iter(ffmpeg_args)
+    for token in it:
+      if token == "-vsync":
+        val = next(it, "0")
+        mapped.extend(["-fps_mode", "passthrough" if val == "0" else val])
+      else:
+        mapped.append(token)
+    return _base_run_ffmpeg(mapped, *args, **kwargs)
+
+  _compat_run_ffmpeg._fps_mode_patched = True  # type: ignore[attr-defined]
+  media._run_ffmpeg = _compat_run_ffmpeg  # type: ignore[attr-defined]
 
 
 def _make_mock_env(num_envs: int = 1):

@@ -15,6 +15,7 @@ import importlib.metadata as _metadata
 import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -142,7 +143,7 @@ def detect_current_backend() -> tuple[str, dict[str, Any]]:
 
 def resolve_backend_python(
   backend: Literal["3.11", "4.0", "4.0-git"],
-  environ: dict[str, str] | None = None,
+  environ: Mapping[str, str] | None = None,
   mjlab_root: Path | None = None,
 ) -> Path:
   """Locate the Python interpreter for the requested MuJoCo backend."""
@@ -183,7 +184,7 @@ def resolve_backend_python(
 def _matches_requested_backend(
   requested: MujocoBackendChoice,
   detected: str,
-  environ: dict[str, str] | None = None,
+  environ: Mapping[str, str] | None = None,
   mjlab_root: Path | None = None,
 ) -> bool:
   if requested == "auto":
@@ -199,10 +200,15 @@ def _matches_requested_backend(
   except RuntimeError:
     return False
 
-  try:
-    same_exe = os.path.samefile(sys.executable, target)
-  except OSError:
-    same_exe = os.path.abspath(sys.executable) == os.path.abspath(target)
+  cur_bin = os.path.realpath(os.path.dirname(os.path.abspath(sys.executable)))
+  tgt_bin = os.path.realpath(os.path.dirname(os.path.abspath(target)))
+  if cur_bin == tgt_bin:
+    try:
+      same_exe = os.path.samefile(sys.executable, target)
+    except OSError:
+      same_exe = os.path.abspath(sys.executable) == os.path.abspath(target)
+  else:
+    same_exe = False
 
   if not same_exe:
     return False
