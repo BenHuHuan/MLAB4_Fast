@@ -77,11 +77,11 @@ uv run pytest tests/test_mlab4_fast.py tests/test_mujoco_40_compat.py -q
 | Bitwise Accuracy vs Reference (`cuda:0` & CPU) | — | **`0.0` exact match** | Lossless |
 | `SdkRecoveryEnv` 5-iter Concurrent Stress (L4) | — | `9.01–23.71 ms` save + `744.2 FPS` CPU Batch Sidecar | Verified |
 
-### Tiangong3 Training Collision Optimization (Opt-In Analytic Capsules vs. CAD Meshes)
+### Tiangong3 Training Collision Optimization (Default Training Analytic Capsules vs. CAD Meshes)
 
-Full root-cause diagnosis, Sim2Real envelope calibration, and multi-regime benchmarks: [**Tiangong3 Capsule Collision Report (`docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md`)**](docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md) (`mjlab.utils.tiangong_capsule_collision.Tiangong3CapsuleCollisionCfg`).
+Full root-cause diagnosis, Sim2Real envelope calibration, and multi-regime benchmarks: [**Tiangong3 Capsule Collision Report (`docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md`)**](docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md) (`mjlab.utils.tiangong_capsule_collision.Tiangong3CapsuleCollisionCfg` — enabled by default alongside `fp32_exact` for fresh Tiangong3 training while keeping full CAD meshes for `--resume`, `play`, and Sim2Sim evaluation).
 
-| Benchmark (`tiangong3_v2_29_head_fixed`, MuJoCo 4.0) | Original CAD `lean` | `fast` (`maxhullvert=64`) | Opt-In `capsule` (`nmesh=0`) | Gain vs. `lean` |
+| Benchmark (`tiangong3_v2_29_head_fixed`, MuJoCo 4.0) | Original CAD `lean` | `fast` (`maxhullvert=64`) | Training Default `capsule` (`nmesh=0`) | Gain vs. `lean` |
 | :--- | :---: | :---: | :---: | :---: |
 | `MjSpec.compile()` Hull Build (`nworld=2048`) | `1,018.99 ms` | `1,008.76 ms` | **`0.65 ms`** | **`1,568×` faster** |
 | Pure Physics Step (`2048` Mixed) / Peak VRAM | `45,377 steps/s` / `5,750 MiB` | `75,649 steps/s` / `2,989 MiB` | **`92,626 steps/s` / `1,268 MiB`** | **`2.04×` / `-78.0%` VRAM** |

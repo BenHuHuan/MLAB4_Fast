@@ -155,7 +155,7 @@ xychart-beta
    - 天工（Tiangong3）训练碰撞体**完全可以且非常适合做胶囊化与内部冗余剔除优化**。
    - 此前训练慢、显存高以及地面碰撞延迟大的本质原因，在于 `sdk_a_scene.xml` 将全部 39 个高面数 CAD 网格直接作为碰撞体，迫使 `mujoco_warp` 走 5 轮图爬山 `plane_convex` 与重型 GJK/EPA/MultiCCD 内核；即便用 `maxhullvert=64`（`fast`），尖端被切成多面体棱面后在触地时仍会触发碰撞对暴增与多点簇拥约束。
    - 改为**贴合 CAD 跟趾斜率与支撑包络的全解析胶囊/球体（`capsule`）**后，彻底消除了全部网格碰撞体（`nmesh=0`），既解决了尖端多面体触地延迟与 12 GiB 显卡 4096 环境 OOM 问题（端到端训练最高提速 **`+66%`**、物理显存降低 **`57%~78%`**），又在收敛版 30k 策略闭环测试中保持了与原始 CAD **100% 一致的站立与倒地起身成功率**。
-2. **推荐使用方式（训练加速 + 全精度验收解耦）**：
-   - **日常大规模训练（推荐开启）**：在 `mjlab` `EntityCfg.collisions` 中传入 `Tiangong3CapsuleCollisionCfg()`，或在 `train_c_sdk_recovery.py` 中显式加上 `--tiangong-collision-profile capsule`（若开启了 `--cpu-eval-sidecar`，后台 CPU 旁路评估会自动使用全精度 CAD `lean` 对每个保存的 checkpoint 做零 GPU 开销的真值校验）。
-   - **Play 可视化 / Sim2Sim 终验 / 真机部署前核验（无需改动，保持默认 `lean`）**：所有 `play`、CPU Sim2Sim 终验与部署工程均保持原厂 CAD 碰撞模型进行最终把关。
-   - **后续可选进阶方向**：若未来在极长程（30k~40k iter）全量训练中进一步验证 `capsule` 从零训练到底的真机上机表现完全一致，再考虑是否将其纳入训练默认预设；目前保持显式可选项最为稳妥。
+2. **工程默认与解耦策略（已对齐生效）**：
+   - **新训练默认开启 `fp32_exact` + `capsule`**：`MLAB4_Fast` 与下游 `train_c_sdk_recovery.py` / `queue_c_sdk_recovery.py` / `colab_autotrain.py` 已统一默认启用无损 IEEE `fp32_exact`；天工（`tiangong3_v2_29_head_fixed`）新训练在 `--tiangong-collision-profile auto` 下自动默认采用 `capsule`（且后台 `--cpu-eval-sidecar` 仍自动使用全精度 CAD `lean` 做零 GPU 开销真值校验；在 `mjlab` 自定义 `EntityCfg` 中也可直接挂载 `Tiangong3CapsuleCollisionCfg()`）。
+   - **续训与回退兼容**：`--resume` 续训历史实验时自动保持原 `lean` 碰撞体不突变；如需历史复现可随时显式传 `--tiangong-collision-profile lean` / `--legacy-tiangong-settings` 或 `--full`。
+   - **Play 可视化 / Sim2Sim 终验 / 真机部署前核验（保持原厂 CAD）**：所有 `play`、CPU Sim2Sim 终验与部署工程均保持原厂 CAD 碰撞模型进行最终把关。
