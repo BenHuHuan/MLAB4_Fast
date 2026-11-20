@@ -23,6 +23,10 @@ class RslRlVecEnvWrapper(VecEnv):
 
     # Reset at the start since rsl_rl does not call reset.
     self.env.reset()
+    self._static_obs_td: TensorDict | None = None
+    self._static_dones_buf = torch.zeros(
+      self.num_envs, device=self.device, dtype=torch.long
+    )
 
   @property
   def cfg(self) -> ManagerBasedRlEnvCfg:
@@ -56,7 +60,7 @@ class RslRlVecEnvWrapper(VecEnv):
 
   @episode_length_buf.setter
   def episode_length_buf(self, value: torch.Tensor) -> None:  # pyright: ignore[reportIncompatibleVariableOverride]
-    self.unwrapped.episode_length_buf = value
+    self.unwrapped.episode_length_buf.copy_(value)
 
   def seed(self, seed: int = -1) -> int:
     return self.unwrapped.seed(seed)
@@ -67,6 +71,7 @@ class RslRlVecEnvWrapper(VecEnv):
 
   def reset(self) -> tuple[TensorDict, dict]:
     obs_dict, extras = self.env.reset()
+    self._static_obs_td = None
     return TensorDict(obs_dict, batch_size=[self.num_envs]), extras
 
   def step(
@@ -78,13 +83,17 @@ class RslRlVecEnvWrapper(VecEnv):
     term_or_trunc = terminated | truncated
     assert isinstance(rew, torch.Tensor)
     assert isinstance(term_or_trunc, torch.Tensor)
-    dones = term_or_trunc.to(dtype=torch.long)
+    self._static_dones_buf.copy_(term_or_trunc)
     if not self.cfg.is_finite_horizon:
       extras["time_outs"] = truncated
+    if self._static_obs_td is None or any(
+      self._static_obs_td.get(k, None) is not v for k, v in obs_dict.items()
+    ):
+      self._static_obs_td = TensorDict(obs_dict, batch_size=[self.num_envs])
     return (
-      TensorDict(obs_dict, batch_size=[self.num_envs]),
+      self._static_obs_td,
       rew,
-      dones,
+      self._static_dones_buf,
       extras,
     )
 

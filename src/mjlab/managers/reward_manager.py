@@ -113,6 +113,27 @@ class RewardManager(ManagerBase):
       term_cfg.func.reset(env_ids=env_ids)
     return extras
 
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], torch.Tensor | None]:
+    """Branchless CUDA-Graph-safe reward sum aggregation & clearing over ``reset_mask``."""
+    mask = reset_mask.to(dtype=torch.bool)
+    mask_f = mask.to(dtype=torch.float32)
+    keys = list(self._episode_sums.keys())
+    sums: torch.Tensor | None = None
+    if keys:
+      scale = 1.0 / float(self._env.max_episode_length_s)
+      vals = [self._episode_sums[k] for k in keys]
+      sums = (torch.stack(vals, dim=0) * mask_f.unsqueeze(0)).sum(dim=1) * scale
+      for v in vals:
+        v.masked_fill_(mask, 0.0)
+    for term_cfg in self._class_term_cfgs:
+      if hasattr(term_cfg.func, "reset_masked"):
+        term_cfg.func.reset_masked(mask)
+      else:
+        term_cfg.func.reset(env_ids=mask)
+    return keys, sums
+
   def compute(self, dt: float) -> torch.Tensor:
     self._reward_buf[:] = 0.0
     scale = dt if self._scale_by_dt else 1.0

@@ -113,30 +113,91 @@ class UniformVelocityCommand(CommandTerm):
     return extras
 
   def _update_command(self, env_ids: torch.Tensor | None = None) -> None:
-    # Pure function of the current state; refreshing all envs is safe.
+    # Pure branchless GPU update: zero host syncs (no nonzero()/any()), CUDA-Graph safe.
     del env_ids
     if self.cfg.heading_command:
-      self.heading_error = wrap_to_pi(self.heading_target - self.robot.data.heading_w)
-      heading_ids = self.is_heading_env.nonzero(as_tuple=False).flatten()
-      self.vel_command_b[heading_ids, 2] = torch.clip(
-        self.cfg.heading_control_stiffness * self.heading_error[heading_ids],
+      heading_err = wrap_to_pi(self.heading_target - self.robot.data.heading_w)
+      self.heading_error.copy_(heading_err)
+      clipped_wz = torch.clip(
+        self.cfg.heading_control_stiffness * self.heading_error,
         min=self.cfg.ranges.ang_vel_z[0],
         max=self.cfg.ranges.ang_vel_z[1],
       )
-    # World-frame envs: rotate world-frame linear vel into body frame.
-    if self.is_world_env.any():
-      w_ids = self.is_world_env.nonzero(as_tuple=False).flatten()
-      heading = self.robot.data.heading_w[w_ids]
+      torch.where(
+        self.is_heading_env,
+        clipped_wz,
+        self.vel_command_b[:, 2],
+        out=self.vel_command_b[:, 2],
+      )
+    if self.cfg.rel_world_envs > 0.0:
+      heading = self.robot.data.heading_w
       cos_h = torch.cos(heading)
       sin_h = torch.sin(heading)
-      vx_w = self.vel_command_w[w_ids, 0]
-      vy_w = self.vel_command_w[w_ids, 1]
-      self.vel_command_b[w_ids, 0] = cos_h * vx_w + sin_h * vy_w
-      self.vel_command_b[w_ids, 1] = -sin_h * vx_w + cos_h * vy_w
+      vx_w = self.vel_command_w[:, 0]
+      vy_w = self.vel_command_w[:, 1]
+      vx_b = cos_h * vx_w + sin_h * vy_w
+      vy_b = -sin_h * vx_w + cos_h * vy_w
+      torch.where(
+        self.is_world_env, vx_b, self.vel_command_b[:, 0], out=self.vel_command_b[:, 0]
+      )
+      torch.where(
+        self.is_world_env, vy_b, self.vel_command_b[:, 1], out=self.vel_command_b[:, 1]
+      )
 
-    standing_env_ids = self.is_standing_env.nonzero(as_tuple=False).flatten()
-    self.vel_command_b[standing_env_ids, :] = 0.0
-    self.vel_command_w[standing_env_ids, :] = 0.0
+    stand_m = self.is_standing_env.unsqueeze(-1)
+    self.vel_command_b.masked_fill_(stand_m, 0.0)
+    self.vel_command_w.masked_fill_(stand_m, 0.0)
+
+  def _resample_command_masked(self, mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe resample matching ``_resample_command`` distribution."""
+    m1 = mask.to(dtype=torch.bool)
+    m2 = m1.unsqueeze(-1)
+    n = self.num_envs
+    r = torch.empty(n, device=self.device)
+    new_b = torch.empty_like(self.vel_command_b)
+    new_b[:, 0] = r.uniform_(*self.cfg.ranges.lin_vel_x)
+    new_b[:, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
+    new_b[:, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
+    if self.cfg.heading_command:
+      new_ht = r.uniform_(*self.cfg.ranges.heading)
+      torch.where(m1, new_ht, self.heading_target, out=self.heading_target)
+      new_is_heading = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
+      torch.where(m1, new_is_heading, self.is_heading_env, out=self.is_heading_env)
+    new_is_standing = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+    torch.where(m1, new_is_standing, self.is_standing_env, out=self.is_standing_env)
+    new_is_world = r.uniform_(0.0, 1.0) <= self.cfg.rel_world_envs
+    torch.where(m1, new_is_world, self.is_world_env, out=self.is_world_env)
+    torch.where(m2, new_b, self.vel_command_w, out=self.vel_command_w)
+
+    new_is_fwd = r.uniform_(0.0, 1.0) <= self.cfg.rel_forward_envs
+    torch.where(m1, new_is_fwd, self.is_forward_env, out=self.is_forward_env)
+    fwd_apply = m1 & new_is_fwd
+    new_b[:, 0] = torch.where(fwd_apply, new_b[:, 0].abs().clamp(min=0.3), new_b[:, 0])
+    new_b[:, 1] = torch.where(fwd_apply, torch.zeros_like(new_b[:, 1]), new_b[:, 1])
+    new_b[:, 2] = torch.where(fwd_apply, torch.zeros_like(new_b[:, 2]), new_b[:, 2])
+    torch.where(m2, new_b, self.vel_command_b, out=self.vel_command_b)
+
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], torch.Tensor | None]:
+    """Branchless CUDA-Graph-safe reset including optional ``init_velocity_prob``."""
+    keys, sums = super().reset_masked(reset_mask)
+    if self.cfg.init_velocity_prob > 0.0:
+      m1 = reset_mask.to(dtype=torch.bool)
+      init_mask = m1 & (
+        torch.rand(self.num_envs, device=self.device) < self.cfg.init_velocity_prob
+      )
+      vel_b = torch.zeros(self.num_envs, 6, device=self.device)
+      vel_b[:, :2] = self.vel_command_b[:, :2]
+      vel_b[:, 5] = self.vel_command_b[:, 2]
+      cur_vel_b = torch.cat(
+        [self.robot.data.root_link_lin_vel_b, self.robot.data.root_link_ang_vel_b],
+        dim=-1,
+      )
+      self.robot.write_root_link_velocity_b_to_sim(
+        torch.where(init_mask.unsqueeze(-1), vel_b, cur_vel_b)
+      )
+    return keys, sums
 
   # GUI.
 

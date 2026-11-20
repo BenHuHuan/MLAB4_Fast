@@ -149,6 +149,18 @@ class ActionManager(ManagerBase):
       term.reset(env_ids=env_ids)
     return {}
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    m2 = reset_mask.to(dtype=torch.bool).unsqueeze(-1)
+    self._prev_action.masked_fill_(m2, 0.0)
+    self._prev_prev_action.masked_fill_(m2, 0.0)
+    self._action.masked_fill_(m2, 0.0)
+    for term in self._terms.values():
+      if hasattr(term, "reset_masked"):
+        term.reset_masked(reset_mask)
+      else:
+        term.reset(env_ids=reset_mask)
+
   def process_action(self, action: torch.Tensor) -> None:
     """Store the raw policy output and route slices to each action term.
 

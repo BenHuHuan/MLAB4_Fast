@@ -184,6 +184,10 @@ class BaseAction(ActionTerm):
     """Reset raw actions to zero for specified environments."""
     self._raw_actions[env_ids] = 0.0
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    self._raw_actions.masked_fill_(reset_mask.to(dtype=torch.bool).unsqueeze(-1), 0.0)
+
 
 ##
 # Joint actions.

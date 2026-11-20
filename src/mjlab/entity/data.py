@@ -154,6 +154,16 @@ class EntityData:
     rows, cols = self._resolve_row_col(env_ids, self.indexing.free_joint_q_sel)
     self.data.qpos[rows, cols] = pose
 
+  def write_root_pose_masked(self, pose: torch.Tensor, mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe root pose write preserving untouched envs' exact ``qpos``."""
+    if self.is_fixed_base:
+      raise ValueError("Cannot write root pose for fixed-base entity.")
+    assert pose.shape[-1] == self.ROOT_POSE_DIM
+    cols = self.indexing.free_joint_q_sel
+    cur = self.data.qpos[:, cols]
+    m = mask.to(device=cur.device, dtype=torch.bool).unsqueeze(-1)
+    self.data.qpos[:, cols] = torch.where(m, pose, cur)
+
   def write_root_velocity(
     self, velocity: torch.Tensor, env_ids: torch.Tensor | slice | None = None
   ) -> None:
@@ -167,6 +177,31 @@ class EntityData:
     velocity_qvel = torch.cat([velocity[:, :3], ang_vel_b], dim=-1)
     v_rows, v_cols = self._resolve_row_col(env_ids, self.indexing.free_joint_v_sel)
     self.data.qvel[v_rows, v_cols] = velocity_qvel
+
+  def write_root_velocity_masked(
+    self, velocity: torch.Tensor, mask: torch.Tensor
+  ) -> None:
+    """Branchless CUDA-Graph-safe root velocity write preserving untouched envs' exact ``qvel``."""
+    if self.is_fixed_base:
+      raise ValueError("Cannot write root velocity for fixed-base entity.")
+    assert velocity.shape[-1] == self.ROOT_VEL_DIM
+    quat_w = self.data.qpos[:, self.indexing.free_joint_quat_sel]
+    ang_vel_b = quat_apply_inverse(quat_w, velocity[:, 3:])
+    velocity_qvel = torch.cat([velocity[:, :3], ang_vel_b], dim=-1)
+    v_cols = self.indexing.free_joint_v_sel
+    cur = self.data.qvel[:, v_cols]
+    m = mask.to(device=cur.device, dtype=torch.bool).unsqueeze(-1)
+    self.data.qvel[:, v_cols] = torch.where(m, velocity_qvel, cur)
+
+  def write_root_state_masked(
+    self, root_state: torch.Tensor, mask: torch.Tensor
+  ) -> None:
+    """Branchless CUDA-Graph-safe root state write preserving untouched envs' exact ``qpos``/``qvel``."""
+    if self.is_fixed_base:
+      raise ValueError("Cannot write root state for fixed-base entity.")
+    assert root_state.shape[-1] == self.ROOT_STATE_DIM
+    self.write_root_pose_masked(root_state[:, : self.ROOT_POSE_DIM], mask)
+    self.write_root_velocity_masked(root_state[:, self.ROOT_POSE_DIM :], mask)
 
   def write_root_velocity_b(
     self, velocity_b: torch.Tensor, env_ids: torch.Tensor | slice | None = None
@@ -297,6 +332,23 @@ class EntityData:
       self.tendon_vel_target[env_ids] = 0.0
       self.tendon_effort_target[env_ids] = 0.0
       self.site_effort_target[env_ids] = 0.0
+
+  def clear_state_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe clear_state using a boolean mask of shape ``(num_envs,)``."""
+    if not self.is_actuated:
+      return
+    m2 = reset_mask.to(dtype=torch.bool).unsqueeze(-1)
+    for buf in (
+      self.joint_pos_target,
+      self.joint_vel_target,
+      self.joint_effort_target,
+      self.tendon_len_target,
+      self.tendon_vel_target,
+      self.tendon_effort_target,
+      self.site_effort_target,
+    ):
+      if buf.numel() > 0:
+        buf.masked_fill_(m2, 0.0)
 
   def _resolve_env_ids(
     self, env_ids: torch.Tensor | slice | None

@@ -908,6 +908,15 @@ class Entity:
     for act in self._actuators:
       act.reset(env_ids)
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    self._data.clear_state_masked(reset_mask)
+    for act in self._actuators:
+      if hasattr(act, "reset_masked"):
+        act.reset_masked(reset_mask)
+      elif getattr(act, "_delay_buffer", None) is not None:
+        act._delay_buffer.reset_masked(reset_mask)
+
   def clear_state(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Deprecated. Use ``reset`` instead."""
     warnings.warn(
@@ -988,6 +997,24 @@ class Entity:
         None, all environments are set.
     """
     self._data.write_root_velocity(root_velocity, env_ids)
+
+  def write_root_state_to_sim_masked(
+    self, root_state: torch.Tensor, mask: torch.Tensor
+  ) -> None:
+    """Branchless CUDA-Graph-safe root state write over boolean ``mask``."""
+    self._data.write_root_state_masked(root_state, mask)
+
+  def write_root_link_pose_to_sim_masked(
+    self, root_pose: torch.Tensor, mask: torch.Tensor
+  ) -> None:
+    """Branchless CUDA-Graph-safe root pose write over boolean ``mask``."""
+    self._data.write_root_pose_masked(root_pose, mask)
+
+  def write_root_link_velocity_to_sim_masked(
+    self, root_velocity: torch.Tensor, mask: torch.Tensor
+  ) -> None:
+    """Branchless CUDA-Graph-safe root velocity write over boolean ``mask``."""
+    self._data.write_root_velocity_masked(root_velocity, mask)
 
   def write_root_link_velocity_b_to_sim(
     self,

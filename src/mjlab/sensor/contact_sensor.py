@@ -415,6 +415,21 @@ class ContactSensor(Sensor[ContactData]):
       for buf in self._history_state.values():
         buf[env_ids] = 0.0
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    self._invalidate_cache()
+    mask = reset_mask.to(dtype=torch.bool)
+    if self._air_time_state is not None:
+      m2 = mask.unsqueeze(-1)
+      self._air_time_state.current_air_time.masked_fill_(m2, 0.0)
+      self._air_time_state.last_air_time.masked_fill_(m2, 0.0)
+      self._air_time_state.current_contact_time.masked_fill_(m2, 0.0)
+      self._air_time_state.last_contact_time.masked_fill_(m2, 0.0)
+    if self._history_state is not None:
+      for buf in self._history_state.values():
+        view_shape = (mask.shape[0],) + (1,) * (buf.ndim - 1)
+        buf.masked_fill_(mask.view(view_shape), 0.0)
+
   def update(self, dt: float) -> None:
     super().update(dt)
     if self._air_time_state is None and self._history_state is None:

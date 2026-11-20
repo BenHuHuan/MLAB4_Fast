@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 
 _DEFAULT_ASSET_CFG = SceneEntityCfg("robot")
 _SE3_KEYS = ("x", "y", "z", "roll", "pitch", "yaw")
+_SE3_RANGE_CACHE: dict[
+  tuple[str, tuple[tuple[float, float], ...]], tuple[torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _sample_se3_range(
@@ -36,9 +39,19 @@ def _sample_se3_range(
   returned tensor has the requested ``shape`` whose last dimension must be 6.
   """
   range_dict = range_dict or {}
-  range_list = [range_dict.get(key, (0.0, 0.0)) for key in _SE3_KEYS]
-  ranges = torch.tensor(range_list, device=device)
-  return sample_uniform(ranges[:, 0], ranges[:, 1], shape, device=device)
+  range_tuple = tuple(
+    (float(lo), float(hi))
+    for lo, hi in (range_dict.get(key, (0.0, 0.0)) for key in _SE3_KEYS)
+  )
+  cache_key = (str(device), range_tuple)
+  cached = _SE3_RANGE_CACHE.get(cache_key)
+  if cached is None:
+    with torch.inference_mode(False):
+      ranges = torch.tensor(range_tuple, device=device, dtype=torch.float32)
+      cached = (ranges[:, 0].contiguous(), ranges[:, 1].contiguous())
+    _SE3_RANGE_CACHE[cache_key] = cached
+  lo, hi = cached
+  return sample_uniform(lo, hi, shape, device=device)
 
 
 def resolve_env_ids(
@@ -335,6 +348,133 @@ def push_by_setting_velocity(
   vel_w = asset.data.root_link_vel_w[env_ids]
   vel_w += _sample_se3_range(velocity_range, vel_w.shape, env.device)
   asset.write_root_link_velocity_to_sim(vel_w, env_ids=env_ids)
+
+
+def push_by_setting_velocity_masked(
+  env: ManagerBasedRlEnv,
+  mask: torch.Tensor,
+  velocity_range: dict[str, tuple[float, float]],
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+  """Branchless CUDA-Graph-safe version of ``push_by_setting_velocity``."""
+  asset: Entity = env.scene[asset_cfg.name]
+  vel_w = asset.data.root_link_vel_w
+  delta = _sample_se3_range(velocity_range, vel_w.shape, env.device)
+  asset.write_root_link_velocity_to_sim_masked(vel_w + delta, mask)
+
+
+push_by_setting_velocity._masked_handler = push_by_setting_velocity_masked  # type: ignore[attr-defined]
+
+
+def reset_root_state_uniform_masked(
+  env: ManagerBasedRlEnv,
+  mask: torch.Tensor,
+  pose_range: dict[str, tuple[float, float]],
+  velocity_range: dict[str, tuple[float, float]] | None = None,
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+  """Branchless CUDA-Graph-safe version of ``reset_root_state_uniform``."""
+  asset: Entity = env.scene[asset_cfg.name]
+  m1 = mask.to(dtype=torch.bool)
+  m2 = m1.unsqueeze(-1)
+  pose_samples = _sample_se3_range(pose_range, (env.num_envs, 6), env.device)
+  default_root_state = asset.data.default_root_state
+  assert default_root_state is not None
+  positions = default_root_state[:, 0:3] + pose_samples[:, 0:3] + env.scene.env_origins
+  orientations_delta = quat_from_euler_xyz(
+    pose_samples[:, 3], pose_samples[:, 4], pose_samples[:, 5]
+  )
+  orientations = quat_mul(default_root_state[:, 3:7], orientations_delta)
+  new_pose = torch.cat([positions, orientations], dim=-1)
+  if asset.is_fixed_base:
+    if not asset.is_mocap:
+      raise ValueError(
+        f"Cannot reset root state for fixed-base non-mocap entity '{asset_cfg.name}'."
+      )
+    cur_pos = asset.data.data.mocap_pos[:, asset.indexing.mocap_id, :].squeeze(1)
+    cur_quat = asset.data.data.mocap_quat[:, asset.indexing.mocap_id, :].squeeze(1)
+    cur_pose = torch.cat([cur_pos, cur_quat], dim=-1)
+    asset.write_mocap_pose_to_sim(torch.where(m2, new_pose, cur_pose))
+    return
+  asset.write_root_link_pose_to_sim_masked(new_pose, m1)
+  vel_samples = _sample_se3_range(velocity_range, (env.num_envs, 6), env.device)
+  new_vel = default_root_state[:, 7:13] + vel_samples
+  asset.write_root_link_velocity_to_sim_masked(new_vel, m1)
+
+
+reset_root_state_uniform._masked_handler = reset_root_state_uniform_masked  # type: ignore[attr-defined]
+
+
+def reset_joints_by_offset_masked(
+  env: ManagerBasedRlEnv,
+  mask: torch.Tensor,
+  position_range: tuple[float, float],
+  velocity_range: tuple[float, float],
+  asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+) -> None:
+  """Branchless CUDA-Graph-safe version of ``reset_joints_by_offset``."""
+  asset: Entity = env.scene[asset_cfg.name]
+  m2 = mask.to(dtype=torch.bool).unsqueeze(-1)
+  default_joint_pos = asset.data.default_joint_pos
+  default_joint_vel = asset.data.default_joint_vel
+  soft_limits = asset.data.soft_joint_pos_limits
+  assert (
+    default_joint_pos is not None
+    and default_joint_vel is not None
+    and soft_limits is not None
+  )
+  jids = asset_cfg.joint_ids
+  if isinstance(jids, list):
+    jids = torch.tensor(jids, device=env.device)
+  jpos = default_joint_pos[:, jids] + sample_uniform(
+    *position_range, default_joint_pos[:, jids].shape, env.device
+  )
+  jpos = jpos.clamp(soft_limits[:, jids, 0], soft_limits[:, jids, 1])
+  jvel = default_joint_vel[:, jids] + sample_uniform(
+    *velocity_range, default_joint_vel[:, jids].shape, env.device
+  )
+  cur_jpos = asset.data.joint_pos[:, jids]
+  cur_jvel = asset.data.joint_vel[:, jids]
+  asset.write_joint_state_to_sim(
+    torch.where(m2, jpos, cur_jpos),
+    torch.where(m2, jvel, cur_jvel),
+    joint_ids=jids,
+  )
+
+
+reset_joints_by_offset._masked_handler = reset_joints_by_offset_masked  # type: ignore[attr-defined]
+
+
+def reset_scene_to_default_masked(
+  env: ManagerBasedRlEnv,
+  mask: torch.Tensor,
+) -> None:
+  """Branchless CUDA-Graph-safe version of ``reset_scene_to_default``."""
+  m2 = mask.to(dtype=torch.bool).unsqueeze(-1)
+  for entity in env.scene.entities.values():
+    if not isinstance(entity, Entity):
+      continue
+    if entity.is_fixed_base and entity.is_mocap:
+      default_root = entity.data.default_root_state
+      new_pos = default_root[:, 0:3] + env.scene.env_origins
+      new_pose = torch.cat([new_pos, default_root[:, 3:7]], dim=-1)
+      cur_pos = entity.data.data.mocap_pos[:, entity.indexing.mocap_id, :].squeeze(1)
+      cur_quat = entity.data.data.mocap_quat[:, entity.indexing.mocap_id, :].squeeze(1)
+      entity.write_mocap_pose_to_sim(
+        torch.where(m2, new_pose, torch.cat([cur_pos, cur_quat], dim=-1))
+      )
+    elif not entity.is_fixed_base:
+      default_root = entity.data.default_root_state.clone()
+      default_root[:, 0:3] = default_root[:, 0:3] + env.scene.env_origins
+      entity.write_root_state_to_sim_masked(default_root, mask)
+    if entity.is_articulated:
+      entity.write_joint_state_to_sim(
+        torch.where(m2, entity.data.default_joint_pos, entity.data.joint_pos),
+        torch.where(m2, entity.data.default_joint_vel, entity.data.joint_vel),
+      )
+
+
+reset_scene_to_default._masked_handler = reset_scene_to_default_masked  # type: ignore[attr-defined]
 
 
 def apply_external_force_torque(

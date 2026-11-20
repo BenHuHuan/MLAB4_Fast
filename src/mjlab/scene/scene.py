@@ -193,6 +193,17 @@ class Scene:
     for sensor in self._sensors.values():
       sensor.reset(env_ids)
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    for ent in self._entities.values():
+      if hasattr(ent, "reset_masked"):
+        ent.reset_masked(reset_mask)
+    for sensor in self._sensors.values():
+      if hasattr(sensor, "reset_masked"):
+        sensor.reset_masked(reset_mask)
+      else:
+        sensor._invalidate_cache()
+
   def update(self, dt: float) -> None:
     for ent in self._entities.values():
       ent.update(dt)

@@ -64,8 +64,20 @@ def fit_terrain_normal(
   has_spread = eigenvalues[:, 1] > eigenvalues[:, 2].clamp(min=eps) * 1e-6
   reliable = enough & plane_like & has_spread & finite
 
-  up = torch.tensor([0.0, 0.0, 1.0], device=device).expand(B, 3)
+  up = _up_vec(device).expand(B, 3)
   return torch.where(reliable.unsqueeze(-1), normal, up)
+
+
+_up_vec_cache: dict[torch.device, torch.Tensor] = {}
+
+
+def _up_vec(device: torch.device) -> torch.Tensor:
+  vec = _up_vec_cache.get(device)
+  if vec is None:
+    with torch.inference_mode(False):
+      vec = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=torch.float32)
+    _up_vec_cache[device] = vec
+  return vec
 
 
 # Cached subsample indices to avoid per-step allocation.

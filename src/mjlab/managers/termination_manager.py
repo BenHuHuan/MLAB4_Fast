@@ -50,6 +50,7 @@ class TerminationManager(ManagerBase):
       self.num_envs, device=self.device, dtype=torch.bool
     )
     self._terminated_buf = torch.zeros_like(self._truncated_buf)
+    self._dones_buf = torch.zeros_like(self._truncated_buf)
 
   def __str__(self) -> str:
     msg = f"<TerminationManager> contains {len(self._term_names)} active terms.\n"
@@ -101,6 +102,23 @@ class TerminationManager(ManagerBase):
       term_cfg.func.reset(env_ids=env_ids)
     return extras
 
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], torch.Tensor | None]:
+    """Branchless CUDA-Graph-safe termination count aggregation over ``reset_mask``."""
+    mask = reset_mask.to(dtype=torch.bool)
+    keys = list(self._term_dones.keys())
+    counts: torch.Tensor | None = None
+    if keys:
+      stacked = torch.stack([self._term_dones[k] for k in keys], dim=0)
+      counts = (stacked & mask.unsqueeze(0)).sum(dim=1, dtype=torch.float32)
+    for term_cfg in self._class_term_cfgs:
+      if hasattr(term_cfg.func, "reset_masked"):
+        term_cfg.func.reset_masked(mask)
+      else:
+        term_cfg.func.reset(env_ids=mask)
+    return keys, counts
+
   def compute(self) -> torch.Tensor:
     self._truncated_buf[:] = False
     self._terminated_buf[:] = False
@@ -112,7 +130,8 @@ class TerminationManager(ManagerBase):
       else:
         self._terminated_buf |= value
       self._term_dones[name][:] = value
-    return self._truncated_buf | self._terminated_buf
+    torch.logical_or(self._truncated_buf, self._terminated_buf, out=self._dones_buf)
+    return self._dones_buf
 
   def get_term(self, name: str) -> torch.Tensor:
     return self._term_dones[name]

@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -16,6 +17,15 @@ from mjlab.utils.cpu_runtime import (
   apply_cpu_execution_plan,
   get_worker_io_cpu_ids,
   partition_server_cpus,
+)
+
+_STANDARD_PPO_CLASS_NAMES = frozenset(
+  {
+    "PPO",
+    "rsl_rl.algorithms:PPO",
+    "rsl_rl.algorithms.ppo:PPO",
+    "rsl_rl.algorithms.ppo.PPO",
+  }
 )
 
 
@@ -50,10 +60,42 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         if train_cfg[key].get("rnn_type") is None:
           for opt in ("rnn_type", "rnn_hidden_dim", "rnn_num_layers"):
             train_cfg[key].pop(opt, None)
+
+    self._strict_rng_parity: bool = bool(train_cfg.get("strict_rng_parity", False))
+    dev_type = torch.device(device).type
+    use_zero_sync_ppo = bool(
+      train_cfg.get("zero_sync_ppo", True)
+      and not self._strict_rng_parity
+      and dev_type == "cuda"
+      and torch.cuda.is_available()
+    )
+    alg_cfg = train_cfg.get("algorithm")
+    if (
+      use_zero_sync_ppo
+      and isinstance(alg_cfg, dict)
+      and alg_cfg.get("class_name") in _STANDARD_PPO_CLASS_NAMES
+    ):
+      alg_cfg["class_name"] = "mjlab.rl.zero_sync_ppo:ZeroSyncPPO"
+
     super().__init__(env, train_cfg, log_dir, device)
     self._async_io_worker: AsyncCheckpointWorker | None = None
     self._cpu_execution_plan = None
     self._batched_logging_enabled: bool = False
+    self._zero_sync_rollout: bool = bool(
+      train_cfg.get("zero_sync_rollout", True)
+      and not self._strict_rng_parity
+      and dev_type == "cuda"
+      and torch.cuda.is_available()
+    )
+    self._mega_graph_mode: str = str(
+      train_cfg.get(
+        "mega_graph_mode",
+        getattr(getattr(env, "unwrapped", env), "cfg", None)
+        and getattr(getattr(env, "unwrapped", env).cfg, "_mega_graph_mode", "off")
+        or "off",
+      )
+    )
+    self._rollout_mega_graph = None
 
   def _install_batched_logger_hooks(self, io_cpu_ids: tuple[int, ...]) -> bool:
     """Wrap TensorBoard SummaryWriter with single-Event protobuf coalescing."""
@@ -133,7 +175,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     self._cpu_execution_plan = plan
     pinned = 0
     if confinement:
-      conf_info = apply_cpu_execution_plan(plan)
+      conf_info = apply_cpu_execution_plan(plan, primary_driver_only=True)
       raw_pinned = conf_info.get("pinned_existing_threads", 0)
       pinned = raw_pinned if isinstance(raw_pinned, int) else 0
     if async_checkpoint and self._async_io_worker is None:
@@ -194,6 +236,343 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         self._async_io_worker = None
     if err is not None:
       raise err
+
+  def learn(
+    self, num_learning_iterations: int, init_at_random_ep_len: bool = False
+  ) -> None:
+    """Zero-sync rollout + learning loop eliminating per-step check_nan and logger.nonzero() syncs."""
+    if not self._zero_sync_rollout:
+      return super().learn(
+        num_learning_iterations=num_learning_iterations,
+        init_at_random_ep_len=init_at_random_ep_len,
+      )
+
+    if init_at_random_ep_len:
+      self.env.episode_length_buf = torch.randint_like(
+        self.env.episode_length_buf, high=int(self.env.max_episode_length)
+      )
+
+    obs = self.env.get_observations().to(self.device)
+    self.alg.train_mode()
+    if self.is_distributed:
+      print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
+      self.alg.broadcast_parameters()
+
+    self.logger.init_logging_writer()
+
+    num_steps = int(self.cfg["num_steps_per_env"])
+    num_envs = int(self.env.num_envs)
+    has_rnd = bool(self.cfg["algorithm"].get("rnd_cfg"))
+    check_nan_enabled = bool(self.cfg.get("check_for_nan", True))
+    unwrapped = getattr(self.env, "unwrapped", self.env)
+
+    # Preallocate zero-sync per-step rollout staging buffers on GPU.
+    step_done_buf = torch.empty(
+      (num_steps, num_envs), dtype=torch.bool, device=self.device
+    )
+    step_rew_buf = torch.empty(
+      (num_steps, num_envs), dtype=torch.float32, device=self.device
+    )
+    step_len_buf = torch.empty(
+      (num_steps, num_envs), dtype=torch.float32, device=self.device
+    )
+    step_erew_buf = (
+      torch.empty((num_steps, num_envs), dtype=torch.float32, device=self.device)
+      if has_rnd
+      else None
+    )
+    step_irew_buf = (
+      torch.empty((num_steps, num_envs), dtype=torch.float32, device=self.device)
+      if has_rnd
+      else None
+    )
+    rollout_nonfinite = torch.zeros((), dtype=torch.bool, device=self.device)
+
+    start_it = self.current_learning_iteration
+    total_it = start_it + num_learning_iterations
+
+    # Optional Tier 2 RolloutStepMegaGraph (fuses Actor/Critic + EnvFullStepGraph).
+    rollout_mega_state = None
+    env_graph = getattr(unwrapped, "_mega_step_graph", None)
+    can_tier2 = (
+      self._mega_graph_mode == "rollout"
+      and env_graph is not None
+      and getattr(self.env, "env", None) is unwrapped
+      and not has_rnd
+      and not getattr(self.alg, "symmetry", None)
+      and not getattr(self.alg.actor, "is_recurrent", False)
+      and not getattr(self.alg.critic, "is_recurrent", False)
+      and type(getattr(self.alg.actor, "distribution", None)).__name__
+      == "GaussianDistribution"
+      and hasattr(self.alg.actor, "get_latent")
+      and hasattr(self.alg.actor, "mlp")
+      and torch.device(self.device) == torch.device(unwrapped.device)
+    )
+    if can_tier2:
+      from tensordict import TensorDict
+
+      from mjlab.envs.mega_step_graph import RolloutStepMegaGraph
+
+      # Bind static obs buffers from current env.obs_buf without advancing history or noise.
+      static_obs_dict = unwrapped.observation_manager.init_static_obs_buffer(
+        unwrapped.obs_buf
+      )
+      obs = TensorDict(static_obs_dict, batch_size=[num_envs])
+      actor = self.alg.actor
+      critic = self.alg.critic
+      clip_act = getattr(self.env, "clip_actions", None)
+      is_finite_horizon = bool(getattr(unwrapped.cfg, "is_finite_horizon", False))
+
+      # Probe distribution shapes once cleanly (use no_grad rather than inference_mode
+      # so staging tensors remain normal non-inference tensors).
+      with torch.no_grad():
+        _lat0 = actor.get_latent(obs, None, None)
+        _mlp0 = actor.mlp(_lat0)
+        actor.distribution.update(_mlp0)
+        _dparams0 = tuple(p.detach().clone() for p in actor.output_distribution_params)
+        _val0 = critic(obs).detach().clone()
+        _act0 = torch.empty_like(actor.output_mean)
+        _lp0 = actor.get_output_log_prob(_act0).detach().clone()
+
+      stg_pre_obs = obs.clone()
+      stg_actions = torch.empty_like(_act0)
+      stg_log_prob = torch.empty_like(_lp0)
+      stg_values = torch.empty_like(_val0)
+      stg_dist_params = tuple(torch.empty_like(p) for p in _dparams0)
+      stg_rewards = torch.empty(num_envs, dtype=torch.float32, device=self.device)
+      stg_dones_bool = torch.empty(num_envs, dtype=torch.bool, device=self.device)
+      stg_dones_long = torch.empty(num_envs, dtype=torch.long, device=self.device)
+      stg_ep_rew = torch.empty(num_envs, dtype=torch.float32, device=self.device)
+      stg_ep_len = torch.empty(num_envs, dtype=torch.float32, device=self.device)
+      gamma = float(self.alg.gamma)
+
+      def _tier2_step_body() -> None:
+        # 1. Snapshot pre-step obs before EnvFullStepGraph mutates static_obs_dict in-place.
+        for k in stg_pre_obs.keys():
+          stg_pre_obs[k].copy_(obs[k])
+        # 2. Actor + Critic forward & CUDA-Graph-safe Philox sampling.
+        lat = actor.get_latent(obs, None, None)
+        mlp_out = actor.mlp(lat)
+        actor.distribution.update(mlp_out)
+        act_sample = (
+          actor.output_mean + torch.randn_like(actor.output_mean) * actor.output_std
+        )
+        stg_actions.copy_(act_sample)
+        stg_log_prob.copy_(actor.get_output_log_prob(stg_actions))
+        stg_values.copy_(critic(obs))
+        for dst_p, src_p in zip(
+          stg_dist_params, actor.output_distribution_params, strict=True
+        ):
+          dst_p.copy_(src_p)
+        # 3. Feed action into EnvFullStepGraph and run full physics + masked reset + obs.
+        if clip_act is not None:
+          torch.clamp(stg_actions, -clip_act, clip_act, out=env_graph._graph_action_in)
+        else:
+          env_graph._graph_action_in.copy_(stg_actions)
+        env_graph._body()
+        # 4. Compute dones, bootstrapped rewards, nonfinite latch, and episode sums.
+        torch.logical_or(
+          unwrapped.reset_terminated, unwrapped.reset_time_outs, out=stg_dones_bool
+        )
+        stg_dones_long.copy_(stg_dones_bool)
+        stg_rewards.copy_(unwrapped.reward_buf)
+        if not is_finite_horizon:
+          stg_rewards.add_(
+            stg_values.squeeze(-1) * unwrapped.reset_time_outs.to(dtype=torch.float32),
+            alpha=gamma,
+          )
+        if check_nan_enabled:
+          bad = ~(
+            torch.isfinite(unwrapped.reward_buf).all()
+            & torch.isfinite(stg_dones_long).all()
+          )
+          for v in obs.values():
+            if torch.is_tensor(v):
+              bad = bad | (~torch.isfinite(v).all())
+          rollout_nonfinite.logical_or_(bad)
+        if self.logger.writer is not None:
+          self.logger.cur_reward_sum.add_(unwrapped.reward_buf)
+          self.logger.cur_episode_length.add_(1.0)
+          stg_ep_rew.copy_(self.logger.cur_reward_sum)
+          stg_ep_len.copy_(self.logger.cur_episode_length)
+          self.logger.cur_reward_sum.masked_fill_(stg_dones_bool, 0.0)
+          self.logger.cur_episode_length.masked_fill_(stg_dones_bool, 0.0)
+
+      tier2_graph = RolloutStepMegaGraph(
+        env_graph=env_graph,
+        modules=(
+          getattr(self.alg, "_raw_actor", self.alg.actor),
+          getattr(self.alg, "_raw_critic", self.alg.critic),
+        ),
+        step_body_fn=_tier2_step_body,
+      )
+      self._rollout_mega_graph = tier2_graph
+      rollout_mega_state = (
+        tier2_graph,
+        stg_pre_obs,
+        stg_actions,
+        stg_log_prob,
+        stg_values,
+        stg_dist_params,
+        stg_rewards,
+        stg_dones_bool,
+        stg_dones_long,
+        stg_ep_rew,
+        stg_ep_len,
+      )
+
+    for it in range(start_it, total_it):
+      start = time.time()
+      rollout_nonfinite.zero_()
+      if hasattr(unwrapped, "begin_rollout_iteration"):
+        unwrapped.begin_rollout_iteration(num_steps)
+
+      with torch.inference_mode():
+        if rollout_mega_state is not None:
+          (
+            tier2_graph,
+            stg_pre_obs,
+            stg_actions,
+            stg_log_prob,
+            stg_values,
+            stg_dist_params,
+            stg_rewards,
+            stg_dones_bool,
+            stg_dones_long,
+            stg_ep_rew,
+            stg_ep_len,
+          ) = rollout_mega_state
+          tier2_graph.verify_or_invalidate()
+          st = self.alg.storage
+          for step_idx in range(num_steps):
+            tier2_graph.run_step()
+            # Copy static staging outputs into RolloutStorage[step_idx] (0 host syncs).
+            self.alg.transition.hidden_states = (None, None)
+            self.alg.transition.observations = stg_pre_obs
+            self.alg.transition.actions = stg_actions
+            self.alg.transition.values = stg_values
+            self.alg.transition.actions_log_prob = stg_log_prob
+            self.alg.transition.distribution_params = stg_dist_params
+            self.alg.transition.rewards = stg_rewards
+            self.alg.transition.dones = stg_dones_long
+            st.add_transition(self.alg.transition)
+            self.alg.transition.clear()
+            if self.logger.writer is not None:
+              step_done_buf[step_idx].copy_(stg_dones_bool)
+              step_rew_buf[step_idx].copy_(stg_ep_rew)
+              step_len_buf[step_idx].copy_(stg_ep_len)
+        else:
+          for step_idx in range(num_steps):
+            actions = self.alg.act(obs)
+            obs, rewards, dones, extras = self.env.step(actions.to(self.env.device))
+            obs, rewards, dones = (
+              obs.to(self.device),
+              rewards.to(self.device),
+              dones.to(self.device),
+            )
+            if check_nan_enabled:
+              bad = ~(torch.isfinite(rewards).all() & torch.isfinite(dones).all())
+              for v in obs.values():
+                if torch.is_tensor(v):
+                  bad = bad | (~torch.isfinite(v).all())
+              rollout_nonfinite.logical_or_(bad)
+
+            self.alg.process_env_step(obs, rewards, dones, extras)
+            intrinsic_rewards = self.alg.intrinsic_rewards if has_rnd else None
+
+            if self.logger.writer is not None:
+              if not getattr(unwrapped, "_staged_episode_logs_active", False):
+                if "episode" in extras:
+                  self.logger.ep_extras.append(extras["episode"])
+                elif "log" in extras:
+                  self.logger.ep_extras.append(extras["log"])
+              if has_rnd and intrinsic_rewards is not None:
+                self.logger.cur_ereward_sum.add_(rewards)
+                self.logger.cur_ireward_sum.add_(intrinsic_rewards)
+                self.logger.cur_reward_sum.add_(rewards + intrinsic_rewards)
+              else:
+                self.logger.cur_reward_sum.add_(rewards)
+              self.logger.cur_episode_length.add_(1.0)
+              done_mask = dones.reshape(-1) > 0
+              step_done_buf[step_idx].copy_(done_mask)
+              step_rew_buf[step_idx].copy_(self.logger.cur_reward_sum)
+              step_len_buf[step_idx].copy_(self.logger.cur_episode_length)
+              self.logger.cur_reward_sum.masked_fill_(done_mask, 0.0)
+              self.logger.cur_episode_length.masked_fill_(done_mask, 0.0)
+              if has_rnd and step_erew_buf is not None and step_irew_buf is not None:
+                step_erew_buf[step_idx].copy_(self.logger.cur_ereward_sum)
+                step_irew_buf[step_idx].copy_(self.logger.cur_ireward_sum)
+                self.logger.cur_ereward_sum.masked_fill_(done_mask, 0.0)
+                self.logger.cur_ireward_sum.masked_fill_(done_mask, 0.0)
+
+        # Single rollout-end flush: nonfinite check + completed episode rewards/lengths + staged logs.
+        if hasattr(unwrapped, "end_rollout_iteration"):
+          flushed_infos = unwrapped.end_rollout_iteration()
+          if self.logger.writer is not None and flushed_infos:
+            self.logger.ep_extras.extend(flushed_infos)
+
+        if check_nan_enabled and bool(rollout_nonfinite.item()):
+          raise ValueError(
+            f"NaN/Inf detected during rollout at iteration {it} (deferred zero-sync guard)."
+          )
+
+        if self.logger.writer is not None:
+          max_ep = self.logger.rewbuffer.maxlen
+          if has_rnd and step_erew_buf is not None and step_irew_buf is not None:
+            packed_t = torch.stack(
+              (step_rew_buf, step_len_buf, step_erew_buf, step_irew_buf), dim=0
+            )[:, step_done_buf]
+            if max_ep is not None and packed_t.shape[1] > max_ep:
+              packed_t = packed_t[:, -max_ep:]
+            if packed_t.shape[1] > 0:
+              packed = packed_t.cpu().tolist()
+              self.logger.rewbuffer.extend(packed[0])
+              self.logger.lenbuffer.extend(packed[1])
+              self.logger.erewbuffer.extend(packed[2])
+              self.logger.irewbuffer.extend(packed[3])
+          else:
+            packed_t = torch.stack((step_rew_buf, step_len_buf), dim=0)[
+              :, step_done_buf
+            ]
+            if max_ep is not None and packed_t.shape[1] > max_ep:
+              packed_t = packed_t[:, -max_ep:]
+            if packed_t.shape[1] > 0:
+              packed = packed_t.cpu().tolist()
+              self.logger.rewbuffer.extend(packed[0])
+              self.logger.lenbuffer.extend(packed[1])
+
+        stop = time.time()
+        collect_time = stop - start
+        start = stop
+
+        self.alg.compute_returns(obs)
+
+      loss_dict = self.alg.update()
+
+      stop = time.time()
+      learn_time = stop - start
+      self.current_learning_iteration = it
+
+      self.logger.log(
+        it=it,
+        start_it=start_it,
+        total_it=total_it,
+        collect_time=collect_time,
+        learn_time=learn_time,
+        loss_dict=loss_dict,
+        learning_rate=self.alg.learning_rate,
+        action_std=self.alg.get_policy().output_std,
+        rnd_weight=self.alg.rnd.weight if has_rnd else None,
+      )
+
+      if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
+        self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+
+    if self.logger.writer is not None:
+      self.save(
+        os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")
+      )  # type: ignore[arg-type]
+      self.logger.stop_logging_writer()
 
   def export_policy_to_onnx(
     self, path: str, filename: str = "policy.onnx", verbose: bool = False

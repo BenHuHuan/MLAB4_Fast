@@ -258,6 +258,199 @@ class ObservationManager(ManagerBase):
         mod.reset(env_ids=env_ids)
     return {}
 
+  def enable_shift_register_buffers(self) -> None:
+    """Upgrade all history and delay buffers to CUDA-Graph-safe ``ShiftRegisterBuffer``."""
+    from mjlab.utils.buffers.shift_register_buffer import ShiftRegisterBuffer
+
+    for group_name, hist_map in self._group_obs_term_history_buffer.items():
+      for term_name, buf in list(hist_map.items()):
+        if isinstance(buf, ShiftRegisterBuffer):
+          continue
+        sr = ShiftRegisterBuffer(
+          max_len=buf.max_length, batch_size=buf.batch_size, device=buf.device
+        )
+        if buf.is_initialized:
+          sr._buffer = buf.buffer.contiguous().clone()
+          sr._feat_shape = tuple(sr._buffer.shape[2:])
+          sr._num_pushes.copy_(buf._num_pushes)
+          sr._pending_reset_mask.copy_(buf._num_pushes == 0)
+        hist_map[term_name] = sr  # type: ignore[assignment]
+      for delay_buf in self._group_obs_term_delay_buffer[group_name].values():
+        delay_buf.enable_shift_register()
+
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset of history/delay/noise buffers."""
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    for group_name, group_cfg in self._group_obs_class_term_cfgs.items():
+      for term_cfg in group_cfg:
+        if hasattr(term_cfg.func, "reset_masked"):
+          term_cfg.func.reset_masked(mask)
+        else:
+          term_cfg.func.reset(env_ids=mask)
+      for term_name in self._group_obs_term_names[group_name]:
+        if term_name in self._group_obs_term_delay_buffer[group_name]:
+          self._group_obs_term_delay_buffer[group_name][term_name].reset_masked(mask)
+        if term_name in self._group_obs_term_history_buffer[group_name]:
+          buf = self._group_obs_term_history_buffer[group_name][term_name]
+          if hasattr(buf, "reset_masked"):
+            buf.reset_masked(mask)
+          else:
+            buf.reset(batch_ids=mask)
+    for group_mods in self._group_obs_class_instances.values():
+      for mod in group_mods.values():
+        if hasattr(mod, "reset_masked"):
+          mod.reset_masked(mask)
+        else:
+          mod.reset(env_ids=mask)
+
+  def init_static_obs_buffer(
+    self,
+    initial_obs: dict[str, torch.Tensor | dict[str, torch.Tensor]] | None = None,
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Preallocate (or refresh in-place) static GPU obs buffers matching ``initial_obs``."""
+    static_buf = getattr(self, "_static_obs_buffer", None)
+    src = initial_obs if initial_obs is not None else self._obs_buffer
+    if static_buf is not None:
+      if src is not None and src is not static_buf:
+        for group_name, val in src.items():
+          if isinstance(val, dict) and isinstance(static_buf.get(group_name), dict):
+            dst_d = static_buf[group_name]
+            for k, v in val.items():
+              if k in dst_d:
+                dst_d[k].copy_(v)
+              else:
+                dst_d[k] = v.detach().clone()
+          elif torch.is_tensor(val) and torch.is_tensor(static_buf.get(group_name)):
+            static_buf[group_name].copy_(val)
+      self._obs_buffer = static_buf
+      return static_buf
+    if not src:
+      return self.compute_masked(reset_mask=None)
+    static_buf = {}
+    for group_name, val in src.items():
+      if isinstance(val, dict):
+        static_buf[group_name] = {k: v.detach().clone() for k, v in val.items()}
+      else:
+        static_buf[group_name] = val.detach().clone()
+    self._static_obs_buffer = static_buf
+    self._obs_buffer = static_buf
+    return static_buf
+
+  def compute_masked(
+    self,
+    reset_mask: torch.Tensor | None = None,
+    *,
+    sdk_bank_overrides: dict[str, dict[str, object]] | None = None,
+  ) -> dict[str, torch.Tensor | dict[str, torch.Tensor]]:
+    """Branchless CUDA-Graph-safe observation compute writing into static GPU buffers."""
+    static_buf = getattr(self, "_static_obs_buffer", None)
+    if static_buf is None:
+      static_buf = {}
+      self._static_obs_buffer = static_buf
+
+    for group_name in self._group_obs_term_names:
+      group_cfg = self.cfg[group_name]
+      group_obs: dict[str, torch.Tensor] = {}
+      sdk_override = (sdk_bank_overrides or {}).get(group_name)
+      for term_name, term_cfg in zip(
+        self._group_obs_term_names[group_name],
+        self._group_obs_term_cfgs[group_name],
+        strict=False,
+      ):
+        obs: torch.Tensor = term_cfg.func(self._env, **term_cfg.params).clone()
+        if isinstance(term_cfg.noise, noise_cfg.NoiseCfg):
+          obs = term_cfg.noise.apply(obs)
+        elif isinstance(term_cfg.noise, noise_cfg.NoiseModelCfg):
+          obs = self._group_obs_class_instances[group_name][term_name](obs)
+        if term_cfg.clip:
+          obs = obs.clip_(min=term_cfg.clip[0], max=term_cfg.clip[1])
+        if term_cfg.scale is not None:
+          scale = term_cfg.scale
+          assert isinstance(scale, torch.Tensor)
+          obs = obs.mul_(scale)
+
+        if group_cfg.nan_check_per_term and group_cfg.nan_policy == "sanitize":
+          obs = torch.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+        if term_cfg.delay_max_lag > 0:
+          delay_buffer = self._group_obs_term_delay_buffer[group_name][term_name]
+          delay_buffer.append(obs)
+          obs = delay_buffer.compute()
+
+        if term_cfg.history_length > 0:
+          hist_buf = self._group_obs_term_history_buffer[group_name][term_name]
+          if hasattr(hist_buf, "append_masked"):
+            if sdk_override is not None and term_name == "frame":
+              hist_buf.append_masked(obs, reset_mask=reset_mask, **sdk_override)
+            else:
+              hist_buf.append_masked(obs, reset_mask=reset_mask)
+          else:
+            hist_buf.append(obs)
+          if term_cfg.flatten_history_dim:
+            group_obs[term_name] = hist_buf.buffer.reshape(self._env.num_envs, -1)
+          else:
+            group_obs[term_name] = hist_buf.buffer
+        else:
+          group_obs[term_name] = obs
+
+      if self._group_obs_concatenate[group_name]:
+        if len(group_obs) == 1:
+          result = next(iter(group_obs.values()))
+        else:
+          cat_dim = self._group_obs_concatenate_dim[group_name]
+          existing = static_buf.get(group_name)
+          vals = list(group_obs.values())
+          if isinstance(existing, torch.Tensor):
+            torch.cat(vals, dim=cat_dim, out=existing)
+            result = existing
+          else:
+            result = torch.cat(vals, dim=cat_dim)
+        if not group_cfg.nan_check_per_term and group_cfg.nan_policy == "sanitize":
+          torch.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0, out=result)
+        existing = static_buf.get(group_name)
+        if isinstance(existing, torch.Tensor):
+          if result is not existing:
+            existing.copy_(result)
+        else:
+          static_buf[group_name] = result.clone() if len(group_obs) == 1 else result
+      else:
+        existing_dict = static_buf.get(group_name)
+        if not isinstance(existing_dict, dict):
+          existing_dict = {}
+          static_buf[group_name] = existing_dict
+        for k, v in group_obs.items():
+          if not group_cfg.nan_check_per_term and group_cfg.nan_policy == "sanitize":
+            v = torch.nan_to_num(v, nan=0.0, posinf=0.0, neginf=0.0)
+          if k in existing_dict:
+            existing_dict[k].copy_(v)
+          else:
+            existing_dict[k] = v.clone()
+
+    self._obs_buffer = static_buf
+    return static_buf
+
+  def is_masked_graph_compatible(self) -> tuple[bool, str]:
+    for group_name in self._group_obs_term_names:
+      group_cfg = self.cfg[group_name]
+      if group_cfg.nan_policy not in ("disabled", "sanitize"):
+        return (
+          False,
+          f"observation group '{group_name}' uses host-branching nan_policy='{group_cfg.nan_policy}'",
+        )
+      for term_cfg in self._group_obs_class_term_cfgs.get(group_name, ()):
+        if not hasattr(term_cfg.func, "reset_masked"):
+          return (
+            False,
+            f"stateful observation term '{term_cfg.func}' lacks reset_masked()",
+          )
+      for term_name, mod in self._group_obs_class_instances.get(group_name, {}).items():
+        if not hasattr(mod, "reset_masked"):
+          return (
+            False,
+            f"stateful noise model on '{group_name}/{term_name}' lacks reset_masked()",
+          )
+    return True, "ok"
+
   def _check_and_handle_nans(
     self, tensor: torch.Tensor, context: str, policy: str
   ) -> torch.Tensor:

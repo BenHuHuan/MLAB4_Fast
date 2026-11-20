@@ -113,6 +113,8 @@ class MotionCommand(CommandTerm):
     )
     self.metrics["error_body_pos"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_body_rot"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_body_lin_vel"] = torch.zeros(self.num_envs, device=self.device)
+    self.metrics["error_body_ang_vel"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_joint_pos"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["error_joint_vel"] = torch.zeros(self.num_envs, device=self.device)
     self.metrics["sampling_entropy"] = torch.zeros(self.num_envs, device=self.device)
@@ -213,38 +215,40 @@ class MotionCommand(CommandTerm):
     return self.robot.data.body_link_ang_vel_w[:, self.robot_anchor_body_index]
 
   def _update_metrics(self):
-    self.metrics["error_anchor_pos"] = torch.norm(
-      self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1
+    self.metrics["error_anchor_pos"].copy_(
+      torch.norm(self.anchor_pos_w - self.robot_anchor_pos_w, dim=-1)
     )
-    self.metrics["error_anchor_rot"] = quat_error_magnitude(
-      self.anchor_quat_w, self.robot_anchor_quat_w
+    self.metrics["error_anchor_rot"].copy_(
+      quat_error_magnitude(self.anchor_quat_w, self.robot_anchor_quat_w)
     )
-    self.metrics["error_anchor_lin_vel"] = torch.norm(
-      self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1
+    self.metrics["error_anchor_lin_vel"].copy_(
+      torch.norm(self.anchor_lin_vel_w - self.robot_anchor_lin_vel_w, dim=-1)
     )
-    self.metrics["error_anchor_ang_vel"] = torch.norm(
-      self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1
+    self.metrics["error_anchor_ang_vel"].copy_(
+      torch.norm(self.anchor_ang_vel_w - self.robot_anchor_ang_vel_w, dim=-1)
     )
 
-    self.metrics["error_body_pos"] = torch.norm(
-      self.body_pos_relative_w - self.robot_body_pos_w, dim=-1
-    ).mean(dim=-1)
-    self.metrics["error_body_rot"] = quat_error_magnitude(
-      self.body_quat_relative_w, self.robot_body_quat_w
-    ).mean(dim=-1)
-
-    self.metrics["error_body_lin_vel"] = torch.norm(
-      self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1
-    ).mean(dim=-1)
-    self.metrics["error_body_ang_vel"] = torch.norm(
-      self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1
-    ).mean(dim=-1)
-
-    self.metrics["error_joint_pos"] = torch.norm(
-      self.joint_pos - self.robot_joint_pos, dim=-1
+    self.metrics["error_body_pos"].copy_(
+      torch.norm(self.body_pos_relative_w - self.robot_body_pos_w, dim=-1).mean(dim=-1)
     )
-    self.metrics["error_joint_vel"] = torch.norm(
-      self.joint_vel - self.robot_joint_vel, dim=-1
+    self.metrics["error_body_rot"].copy_(
+      quat_error_magnitude(self.body_quat_relative_w, self.robot_body_quat_w).mean(
+        dim=-1
+      )
+    )
+
+    self.metrics["error_body_lin_vel"].copy_(
+      torch.norm(self.body_lin_vel_w - self.robot_body_lin_vel_w, dim=-1).mean(dim=-1)
+    )
+    self.metrics["error_body_ang_vel"].copy_(
+      torch.norm(self.body_ang_vel_w - self.robot_body_ang_vel_w, dim=-1).mean(dim=-1)
+    )
+
+    self.metrics["error_joint_pos"].copy_(
+      torch.norm(self.joint_pos - self.robot_joint_pos, dim=-1)
+    )
+    self.metrics["error_joint_vel"].copy_(
+      torch.norm(self.joint_vel - self.robot_joint_vel, dim=-1)
     )
 
   def _adaptive_sampling(self, env_ids: torch.Tensor):
@@ -401,10 +405,161 @@ class MotionCommand(CommandTerm):
       quat_mul(robot_anchor_quat_w_repeat, quat_inv(anchor_quat_w_repeat))
     )
 
-    self.body_quat_relative_w = quat_mul(delta_ori_w, self.body_quat_w)
-    self.body_pos_relative_w = delta_pos_w + quat_apply(
-      delta_ori_w, self.body_pos_w - anchor_pos_w_repeat
+    self.body_quat_relative_w.copy_(quat_mul(delta_ori_w, self.body_quat_w))
+    self.body_pos_relative_w.copy_(
+      delta_pos_w + quat_apply(delta_ori_w, self.body_pos_w - anchor_pos_w_repeat)
     )
+
+  def _get_cached_pose_vel_ranges(self) -> tuple[torch.Tensor, torch.Tensor]:
+    pose_r = getattr(self, "_cached_pose_ranges", None)
+    vel_r = getattr(self, "_cached_vel_ranges", None)
+    if pose_r is None or vel_r is None:
+      keys = ("x", "y", "z", "roll", "pitch", "yaw")
+      pose_r = torch.tensor(
+        [self.cfg.pose_range.get(k, (0.0, 0.0)) for k in keys],
+        device=self.device,
+        dtype=torch.float32,
+      )
+      vel_r = torch.tensor(
+        [self.cfg.velocity_range.get(k, (0.0, 0.0)) for k in keys],
+        device=self.device,
+        dtype=torch.float32,
+      )
+      self._cached_pose_ranges = pose_r
+      self._cached_vel_ranges = vel_r
+    return pose_r, vel_r
+
+  def _resample_command_masked(self, mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe command resample (uses AsyncResetPool if attached)."""
+    m1 = mask.to(device=self.device, dtype=torch.bool)
+    m2 = m1.unsqueeze(-1)
+    # Record failure histogram branchlessly for adaptive sampling.
+    if self.cfg.sampling_mode == "adaptive":
+      failed_mask = m1 & self._env.termination_manager.terminated
+      current_bin_index = torch.clamp(
+        (self.time_steps * self.bin_count) // max(self.motion.time_step_total, 1),
+        0,
+        self.bin_count - 1,
+      )
+      self._current_bin_failed.index_add_(
+        0, current_bin_index, failed_mask.to(dtype=torch.float32)
+      )
+
+    pool = getattr(self, "_async_reset_pool", None)
+    if pool is not None:
+      batch = pool.consume(m1)
+      torch.where(m1, batch["time_steps"], self.time_steps, out=self.time_steps)
+      root_pos = batch["root_pos_local"] + self._env.scene.env_origins
+      root_state = torch.cat(
+        [root_pos, batch["root_quat"], batch["root_lin_vel"], batch["root_ang_vel"]],
+        dim=-1,
+      )
+      soft_limits = self.robot.data.soft_joint_pos_limits
+      jpos = torch.clip(batch["joint_pos"], soft_limits[:, :, 0], soft_limits[:, :, 1])
+      jvel = batch["joint_vel"]
+    else:
+      if self.cfg.sampling_mode == "start":
+        new_steps = torch.zeros_like(self.time_steps)
+      elif self.cfg.sampling_mode == "uniform":
+        new_steps = torch.randint(
+          0, self.motion.time_step_total, (self.num_envs,), device=self.device
+        )
+        self.metrics["sampling_entropy"].fill_(1.0)
+        self.metrics["sampling_top1_prob"].fill_(1.0 / self.bin_count)
+        self.metrics["sampling_top1_bin"].fill_(0.5)
+      else:
+        probs = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(
+          self.bin_count
+        )
+        probs = torch.nn.functional.pad(
+          probs.unsqueeze(0).unsqueeze(0),
+          (0, self.cfg.adaptive_kernel_size - 1),
+          mode="replicate",
+        )
+        probs = torch.nn.functional.conv1d(probs, self.kernel.view(1, 1, -1)).view(-1)
+        probs = probs / probs.sum()
+        sampled_bins = torch.multinomial(probs, self.num_envs, replacement=True)
+        new_steps = (
+          (
+            sampled_bins
+            + sample_uniform(0.0, 1.0, (self.num_envs,), device=self.device)
+          )
+          / self.bin_count
+          * (self.motion.time_step_total - 1)
+        ).long()
+        H = -(probs * (probs + 1e-12).log()).sum()
+        H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else 1.0
+        pmax, imax = probs.max(dim=0)
+        self.metrics["sampling_entropy"].fill_(H_norm)
+        self.metrics["sampling_top1_prob"].fill_(pmax)
+        self.metrics["sampling_top1_bin"].fill_(imax.float() / self.bin_count)
+
+      torch.where(m1, new_steps, self.time_steps, out=self.time_steps)
+      pose_r, vel_r = self._get_cached_pose_vel_ranges()
+      rand_p = sample_uniform(
+        pose_r[:, 0], pose_r[:, 1], (self.num_envs, 6), device=self.device
+      )
+      rand_v = sample_uniform(
+        vel_r[:, 0], vel_r[:, 1], (self.num_envs, 6), device=self.device
+      )
+      root_pos = self.body_pos_w[:, 0] + rand_p[:, 0:3]
+      ori_delta = quat_from_euler_xyz(rand_p[:, 3], rand_p[:, 4], rand_p[:, 5])
+      root_ori = quat_mul(ori_delta, self.body_quat_w[:, 0])
+      root_lin_vel = self.body_lin_vel_w[:, 0] + rand_v[:, :3]
+      root_ang_vel = self.body_ang_vel_w[:, 0] + rand_v[:, 3:]
+      root_state = torch.cat([root_pos, root_ori, root_lin_vel, root_ang_vel], dim=-1)
+
+      soft_limits = self.robot.data.soft_joint_pos_limits
+      jpos = self.joint_pos + sample_uniform(
+        lower=self.cfg.joint_position_range[0],
+        upper=self.cfg.joint_position_range[1],
+        size=self.joint_pos.shape,
+        device=self.device,
+      )
+      jpos = torch.clip(jpos, soft_limits[:, :, 0], soft_limits[:, :, 1])
+      jvel = self.joint_vel
+
+    cur_jpos = self.robot.data.joint_pos
+    cur_jvel = self.robot.data.joint_vel
+    self.robot.write_joint_state_to_sim(
+      torch.where(m2, jpos, cur_jpos),
+      torch.where(m2, jvel, cur_jvel),
+    )
+    self.robot.write_root_state_to_sim_masked(root_state, m1)
+    self.robot.reset_masked(m1)
+    self._pending_forward = False
+
+  def pre_forward_wraparound_masked(self, reset_mask: torch.Tensor) -> torch.Tensor:
+    """Fold motion wraparound and timer-expiry resamples BEFORE the single post-step forward."""
+    not_reset = ~reset_mask.to(device=self.device, dtype=torch.bool)
+    next_steps = self.time_steps + not_reset.to(dtype=self.time_steps.dtype)
+    wrap_mask = not_reset & (next_steps >= self.motion.time_step_total)
+    return wrap_mask
+
+  def compute_masked(self, dt: float | torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe compute (wraparound already folded before sim.forward)."""
+    self._update_metrics()
+    self.time_left.sub_(dt)
+    # Advance non-reset envs (reset envs received dt == 0.0 -> step_inc == 0).
+    if isinstance(dt, torch.Tensor):
+      step_inc = (dt > 0.0).to(dtype=self.time_steps.dtype)
+      self.time_steps.add_(step_inc)
+    else:
+      self.time_steps.add_(1)
+    wrap_or_timer = (self.time_steps >= self.motion.time_step_total) | (
+      self.time_left <= 0.0
+    )
+    self.time_steps.clamp_max_(max(self.motion.time_step_total - 1, 0))
+    # Only resample timer-expired envs if resampling range is finite and hit.
+    if self.cfg.resampling_time_range[0] < 1.0e8:
+      self._resample_masked(wrap_or_timer)
+    self.update_relative_body_poses()
+    if self.cfg.sampling_mode == "adaptive":
+      alpha = float(self.cfg.adaptive_alpha)
+      self.bin_failed_count.mul_(1.0 - alpha).add_(
+        self._current_bin_failed, alpha=alpha
+      )
+      self._current_bin_failed.zero_()
 
   def reset(self, env_ids: torch.Tensor | slice | None) -> dict[str, float]:
     extras = super().reset(env_ids)
@@ -436,9 +591,9 @@ class MotionCommand(CommandTerm):
     # Fold failure counts into the EMA only on the per-step update so
     # manual resets do not decay it faster.
     if env_ids is None and self.cfg.sampling_mode == "adaptive":
-      self.bin_failed_count = (
-        self.cfg.adaptive_alpha * self._current_bin_failed
-        + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
+      alpha = float(self.cfg.adaptive_alpha)
+      self.bin_failed_count.mul_(1.0 - alpha).add_(
+        self._current_bin_failed, alpha=alpha
       )
       self._current_bin_failed.zero_()
 

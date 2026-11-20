@@ -558,6 +558,7 @@ class Simulation:
     self._sensor_context: SensorContext | None = None
 
     self.use_cuda_graph = self._should_use_cuda_graph()
+    self._inline_warp_kernels: bool = False
     self.create_graph()
 
     self.nan_guard = NanGuard(self.cfg.nan_guard, self.num_envs, self._mj_model)
@@ -959,10 +960,41 @@ class Simulation:
     elif nvel > 0 or nlimitvel > 0:
       mjwarp.sensor_vel(m, d)
 
+  def _should_inline_warp_on_torch_stream(self) -> bool:
+    """Return True when Warp kernels must run inline on the current PyTorch CUDA stream.
+
+    Required when an outer CUDA Graph (e.g., ``EnvFullStepGraph`` or
+    ``RolloutStepMegaGraph``) is warming up or capturing on a dedicated
+    ``torch.cuda.Stream``, because nested ``wp.capture_launch`` on Warp's
+    default stream cannot be recorded into an outer capturing stream.
+    """
+    if not self.wp_device.is_cuda:
+      return False
+    return bool(
+      getattr(self, "_inline_warp_kernels", False)
+      or torch.cuda.is_current_stream_capturing()
+    )
+
+  def _active_warp_stream(self) -> wp.Stream:
+    """Return a Warp Stream matching the current PyTorch CUDA stream without creating an unregistered wrapper when already scoped."""
+    torch_stream = torch.cuda.current_stream(self.device)
+    cur_wp = wp.get_stream(self.wp_device)
+    if cur_wp.cuda_stream == torch_stream.cuda_stream:
+      return cur_wp
+    return wp.stream_from_torch(torch_stream)
+
   def forward_kinematics_and_sensors(self) -> None:
     """Refresh kinematic quantities and pos/vel sensors without collision/solver."""
     with wp.ScopedDevice(self.wp_device):
-      if self.use_cuda_graph and self.kinematics_forward_graph is not None:
+      if self._should_inline_warp_on_torch_stream():
+        with wp.ScopedStream(
+          self._active_warp_stream(), sync_enter=False, sync_exit=False
+        ):
+          if self.can_use_kinematic_forward(allow_unread_contact_sensors=True):
+            self._forward_kinematics_and_sensors_kernel()
+          else:
+            mjwarp.forward(self.wp_model, self.wp_data)
+      elif self.use_cuda_graph and self.kinematics_forward_graph is not None:
         wp.capture_launch(self.kinematics_forward_graph)
       elif self.can_use_kinematic_forward(allow_unread_contact_sensors=True):
         self._forward_kinematics_and_sensors_kernel()
@@ -971,7 +1003,12 @@ class Simulation:
 
   def forward(self) -> None:
     with wp.ScopedDevice(self.wp_device):
-      if self.use_cuda_graph and self.forward_graph is not None:
+      if self._should_inline_warp_on_torch_stream():
+        with wp.ScopedStream(
+          self._active_warp_stream(), sync_enter=False, sync_exit=False
+        ):
+          mjwarp.forward(self.wp_model, self.wp_data)
+      elif self.use_cuda_graph and self.forward_graph is not None:
         wp.capture_launch(self.forward_graph)
       else:
         mjwarp.forward(self.wp_model, self.wp_data)
@@ -979,7 +1016,12 @@ class Simulation:
   def step(self) -> None:
     with wp.ScopedDevice(self.wp_device):
       with self.nan_guard.watch(self.data):
-        if self.use_cuda_graph and self.step_graph is not None:
+        if self._should_inline_warp_on_torch_stream():
+          with wp.ScopedStream(
+            self._active_warp_stream(), sync_enter=False, sync_exit=False
+          ):
+            mjwarp.step(self.wp_model, self.wp_data)
+        elif self.use_cuda_graph and self.step_graph is not None:
           wp.capture_launch(self.step_graph)
         else:
           mjwarp.step(self.wp_model, self.wp_data)
@@ -992,7 +1034,26 @@ class Simulation:
         self._reset_mask.fill_(False)
         self._reset_mask[env_ids] = True
 
-      if self.use_cuda_graph and self.reset_graph is not None:
+      if self._should_inline_warp_on_torch_stream():
+        with wp.ScopedStream(
+          self._active_warp_stream(), sync_enter=False, sync_exit=False
+        ):
+          mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
+      elif self.use_cuda_graph and self.reset_graph is not None:
+        wp.capture_launch(self.reset_graph)
+      else:
+        mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
+
+  def reset_mask(self, mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
+    with wp.ScopedDevice(self.wp_device):
+      self._reset_mask.copy_(mask)
+      if self._should_inline_warp_on_torch_stream():
+        with wp.ScopedStream(
+          self._active_warp_stream(), sync_enter=False, sync_exit=False
+        ):
+          mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
+      elif self.use_cuda_graph and self.reset_graph is not None:
         wp.capture_launch(self.reset_graph)
       else:
         mjwarp.reset_data(self.wp_model, self.wp_data, reset=self._reset_mask_wp)
@@ -1020,7 +1081,12 @@ class Simulation:
     ctx.prepare()
 
     with wp.ScopedDevice(self.wp_device):
-      if self.use_cuda_graph and self.sense_graph is not None:
+      if self._should_inline_warp_on_torch_stream():
+        with wp.ScopedStream(
+          self._active_warp_stream(), sync_enter=False, sync_exit=False
+        ):
+          self._sense_kernel()
+      elif self.use_cuda_graph and self.sense_graph is not None:
         wp.capture_launch(self.sense_graph)
       else:
         self._sense_kernel()

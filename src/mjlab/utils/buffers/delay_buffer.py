@@ -6,7 +6,8 @@ from collections.abc import Sequence
 
 import torch
 
-from mjlab.utils.buffers import CircularBuffer
+from mjlab.utils.buffers.circular_buffer import CircularBuffer
+from mjlab.utils.buffers.shift_register_buffer import ShiftRegisterBuffer
 
 
 class DelayBuffer:
@@ -128,6 +129,7 @@ class DelayBuffer:
     update_period: int = 0,
     per_env_phase: bool = True,
     generator: torch.Generator | None = None,
+    use_shift_register: bool = False,
   ) -> None:
     if min_lag < 0:
       raise ValueError(f"min_lag must be >= 0, got {min_lag}")
@@ -149,7 +151,8 @@ class DelayBuffer:
     self.generator = generator
 
     buffer_size = max_lag + 1 if max_lag > 0 else 1
-    self._buffer = CircularBuffer(
+    buf_cls = ShiftRegisterBuffer if use_shift_register else CircularBuffer
+    self._buffer: CircularBuffer | ShiftRegisterBuffer = buf_cls(
       max_len=buffer_size, batch_size=batch_size, device=device
     )
     self._current_lags = torch.zeros(batch_size, dtype=torch.long, device=device)
@@ -218,6 +221,41 @@ class DelayBuffer:
       )
       self._phase_offsets[idx] = new_phases[idx]
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(batch_size,)``."""
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    if isinstance(self._buffer, ShiftRegisterBuffer):
+      self._buffer.reset_masked(mask)
+    else:
+      self._buffer.reset(batch_ids=mask)
+    self._current_lags.masked_fill_(mask, 0)
+    self._step_count.masked_fill_(mask, 0)
+    if self.update_period > 0 and self.per_env_phase:
+      new_phases = torch.randint(
+        0,
+        self.update_period,
+        (self.batch_size,),
+        dtype=torch.long,
+        device=self.device,
+        generator=self.generator,
+      )
+      torch.where(mask, new_phases, self._phase_offsets, out=self._phase_offsets)
+
+  def enable_shift_register(self) -> None:
+    """Upgrade underlying history storage to CUDA-Graph-safe ``ShiftRegisterBuffer``."""
+    if isinstance(self._buffer, ShiftRegisterBuffer):
+      return
+    old = self._buffer
+    sr = ShiftRegisterBuffer(
+      max_len=old.max_length, batch_size=old.batch_size, device=old.device
+    )
+    if old.is_initialized:
+      sr._buffer = old.buffer.contiguous().clone()
+      sr._feat_shape = tuple(sr._buffer.shape[2:])
+      sr._num_pushes.copy_(old._num_pushes)
+      sr._pending_reset_mask.copy_(old._num_pushes == 0)
+    self._buffer = sr
+
   def append(self, data: torch.Tensor) -> None:
     """Append new observation to buffer.
 
@@ -282,7 +320,7 @@ class DelayBuffer:
     else:
       should_update = torch.ones(self.batch_size, dtype=torch.bool, device=self.device)
     new_lags = self._sample_lags(should_update)
-    self._current_lags = torch.where(should_update, new_lags, self._current_lags)
+    torch.where(should_update, new_lags, self._current_lags, out=self._current_lags)
     self._step_count += 1
 
   def _sample_lags(self, mask: torch.Tensor) -> torch.Tensor:

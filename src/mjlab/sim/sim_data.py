@@ -67,8 +67,15 @@ class TorchArray:
   def __setitem__(self, idx: Any, value: Any) -> None:
     """Set item(s) in the tensor using standard indexing."""
     if self._is_cuda and self._torch_stream is not None:
-      with torch.cuda.stream(self._torch_stream):
+      cur_stream = torch.cuda.current_stream(self._tensor.device)
+      if (
+        torch.cuda.is_current_stream_capturing()
+        or cur_stream.cuda_stream == wp.get_stream(self._wp_array.device).cuda_stream
+      ):
         self._tensor[idx] = value
+      else:
+        with torch.cuda.stream(self._torch_stream):
+          self._tensor[idx] = value
     else:
       self._tensor[idx] = value
 
