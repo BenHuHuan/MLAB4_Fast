@@ -283,8 +283,9 @@ class ObservationManager(ManagerBase):
     mask = reset_mask.to(device=self.device, dtype=torch.bool)
     for group_name, group_cfg in self._group_obs_class_term_cfgs.items():
       for term_cfg in group_cfg:
-        if hasattr(term_cfg.func, "reset_masked"):
-          term_cfg.func.reset_masked(mask)
+        term_reset = getattr(term_cfg.func, "reset_masked", None)
+        if callable(term_reset):
+          term_reset(mask)
         else:
           term_cfg.func.reset(env_ids=mask)
       for term_name in self._group_obs_term_names[group_name]:
@@ -292,14 +293,16 @@ class ObservationManager(ManagerBase):
           self._group_obs_term_delay_buffer[group_name][term_name].reset_masked(mask)
         if term_name in self._group_obs_term_history_buffer[group_name]:
           buf = self._group_obs_term_history_buffer[group_name][term_name]
-          if hasattr(buf, "reset_masked"):
-            buf.reset_masked(mask)
+          buf_reset = getattr(buf, "reset_masked", None)
+          if callable(buf_reset):
+            buf_reset(mask)
           else:
             buf.reset(batch_ids=mask)
     for group_mods in self._group_obs_class_instances.values():
       for mod in group_mods.values():
-        if hasattr(mod, "reset_masked"):
-          mod.reset_masked(mask)
+        mod_reset = getattr(mod, "reset_masked", None)
+        if callable(mod_reset):
+          mod_reset(mask)
         else:
           mod.reset(env_ids=mask)
 
@@ -316,6 +319,7 @@ class ObservationManager(ManagerBase):
           if isinstance(val, dict) and isinstance(static_buf.get(group_name), dict):
             dst_d = static_buf[group_name]
             for k, v in val.items():
+              assert isinstance(v, torch.Tensor)
               if k in dst_d:
                 dst_d[k].copy_(v)
               else:
@@ -329,7 +333,11 @@ class ObservationManager(ManagerBase):
     static_buf = {}
     for group_name, val in src.items():
       if isinstance(val, dict):
-        static_buf[group_name] = {k: v.detach().clone() for k, v in val.items()}
+        group_dict: dict[str, torch.Tensor] = {}
+        for k, v in val.items():
+          assert isinstance(k, str) and isinstance(v, torch.Tensor)
+          group_dict[k] = v.detach().clone()
+        static_buf[group_name] = group_dict
       else:
         static_buf[group_name] = val.detach().clone()
     self._static_obs_buffer = static_buf
@@ -379,11 +387,12 @@ class ObservationManager(ManagerBase):
 
         if term_cfg.history_length > 0:
           hist_buf = self._group_obs_term_history_buffer[group_name][term_name]
-          if hasattr(hist_buf, "append_masked"):
+          append_fn = getattr(hist_buf, "append_masked", None)
+          if callable(append_fn):
             if sdk_override is not None and term_name == "frame":
-              hist_buf.append_masked(obs, reset_mask=reset_mask, **sdk_override)
+              append_fn(obs, reset_mask=reset_mask, **sdk_override)
             else:
-              hist_buf.append_masked(obs, reset_mask=reset_mask)
+              append_fn(obs, reset_mask=reset_mask)
           else:
             hist_buf.append(obs)
           if term_cfg.flatten_history_dim:

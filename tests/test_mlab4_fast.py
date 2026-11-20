@@ -18,7 +18,12 @@ from mjlab.utils.async_io import (
   consume_prewarmed_async_worker,
   prewarm_async_checkpoint_worker,
 )
-from mjlab.utils.rollout_optimizations import FP32_EXACT_ENABLED, configure_fp32_exact
+from mjlab.utils.rollout_optimizations import (
+  FP32_EXACT_ENABLED,
+  configure_fp32_exact,
+  configure_fp32_fast,
+  resolve_fp32_execution_mode,
+)
 
 if TYPE_CHECKING:
   from mjlab.envs import ManagerBasedRlEnvCfg
@@ -33,7 +38,41 @@ def test_mlab4_fast_defaults_permanently_enabled():
   )
   assert cfg.mujoco_backend == "4.0"
   assert cfg.fp32_exact is True
+  assert cfg.fp32_fast is False
   assert cfg.cpu_optimizations is True
+  assert cfg.mega_graph_mode == "auto"
+  assert cfg.reset_pool_mode == "auto"
+  assert cfg.strict_rng_parity is False
+
+  # Default fp32_exact naturally enables #2A + #2B + #1A (Tier 1 env graph, strict IEEE).
+  exact_res = resolve_fp32_execution_mode(
+    fp32_exact=cfg.fp32_exact,
+    fp32_fast=cfg.fp32_fast,
+    strict_rng_parity=cfg.strict_rng_parity,
+    mega_graph_mode=cfg.mega_graph_mode,
+    reset_pool_mode=cfg.reset_pool_mode,
+  )
+  assert exact_res["mode"] == "fp32_exact"
+  assert exact_res["allow_tf32"] is False
+  assert exact_res["zero_sync_ppo"] is True
+  assert exact_res["zero_sync_rollout"] is True
+  assert exact_res["mega_graph_mode"] == "env"
+  assert exact_res["reset_pool_mode"] == "auto"
+
+  # fp32_fast naturally upgrades to #1B (Tier 2 rollout mega-graph, still strict IEEE).
+  fast_res = resolve_fp32_execution_mode(
+    fp32_exact=cfg.fp32_exact,
+    fp32_fast=True,
+    strict_rng_parity=cfg.strict_rng_parity,
+    mega_graph_mode=cfg.mega_graph_mode,
+    reset_pool_mode=cfg.reset_pool_mode,
+  )
+  assert fast_res["mode"] == "fp32_fast"
+  assert fast_res["allow_tf32"] is False
+  assert fast_res["zero_sync_ppo"] is True
+  assert fast_res["zero_sync_rollout"] is True
+  assert fast_res["mega_graph_mode"] == "rollout"
+  assert fast_res["reset_pool_mode"] == "auto"
 
 
 def test_configure_fp32_exact_sets_flags():
@@ -44,8 +83,17 @@ def test_configure_fp32_exact_sets_flags():
   assert env_cfg._rollout_optimization_mode == "fp32_exact"
   assert env_cfg._use_substep_cuda_graph is True
   assert env_cfg._use_zero_sync_optimizations is True
+  assert env_cfg._mega_graph_mode == "env"
+  assert env_cfg._reset_pool_mode == "auto"
   assert cmd.batch_reset_metrics is True
   assert cmd.cache_reference_kernels is True
+
+  env_cfg_fast = SimpleNamespace(commands={"motion": cmd})
+  res_fast = configure_fp32_fast(env_cfg_fast, enabled=True)
+  assert res_fast["fp32_fast"] is True
+  assert env_cfg_fast._rollout_optimization_mode == "fp32_fast"
+  assert env_cfg_fast._mega_graph_mode == "rollout"
+  assert env_cfg_fast._reset_pool_mode == "auto"
 
 
 def test_cpu_runtime_pcore_filtering():
@@ -321,7 +369,9 @@ def test_run_train_enables_step_opts_and_respects_cpu_opt_false(
 
   monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
   monkeypatch.setattr(train_mod, "configure_torch_backends", lambda **kw: None)
-  monkeypatch.setattr(train_mod, "configure_fp32_exact", lambda cfg, enabled=True: {})
+  monkeypatch.setattr(
+    train_mod, "configure_fp32_exact", lambda cfg, enabled=True, **kw: {}
+  )
   monkeypatch.setattr(
     train_mod,
     "partition_server_cpus",

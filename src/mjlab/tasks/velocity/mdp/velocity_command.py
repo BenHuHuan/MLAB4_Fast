@@ -159,6 +159,7 @@ class UniformVelocityCommand(CommandTerm):
     new_b[:, 1] = r.uniform_(*self.cfg.ranges.lin_vel_y)
     new_b[:, 2] = r.uniform_(*self.cfg.ranges.ang_vel_z)
     if self.cfg.heading_command:
+      assert self.cfg.ranges.heading is not None
       new_ht = r.uniform_(*self.cfg.ranges.heading)
       torch.where(m1, new_ht, self.heading_target, out=self.heading_target)
       new_is_heading = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs

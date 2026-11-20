@@ -5,6 +5,7 @@ and Phase 3 (#1B Tier 2 RolloutStepMegaGraph) under strict IEEE FP32.
 from __future__ import annotations
 
 import warnings
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -239,15 +240,19 @@ def test_real_velocity_env_tier1_and_tier2_mega_graph_ieee_zero_sync(tmp_path):
     # Verify Tier 1 EnvFullStepGraph.step() returns non-aliased observations so
     # PPO.act(obs_t) -> env.step(act) -> PPO.process_env_step never clobbers obs_t!
     o_prev, r_prev, _, _, _ = env.step(act)
-    o_prev_snap = o_prev["actor"].clone()
+    o_prev_actor = o_prev["actor"]
+    assert isinstance(o_prev_actor, torch.Tensor)
+    o_prev_snap = o_prev_actor.clone()
     r_prev_snap = r_prev.clone()
     act_perturbed = torch.full_like(act, 0.25)
     o_next, _, _, _, _ = env.step(act_perturbed)
-    assert torch.equal(o_prev["actor"], o_prev_snap), (
+    o_next_actor = o_next["actor"]
+    assert isinstance(o_next_actor, torch.Tensor)
+    assert torch.equal(o_prev_actor, o_prev_snap), (
       "Tier 1 EnvFullStepGraph.step() mutated previously returned obs_t in-place!"
     )
     assert torch.equal(r_prev, r_prev_snap)
-    assert not torch.equal(o_prev["actor"], o_next["actor"])
+    assert not torch.equal(o_prev_actor, o_next_actor)
 
     # Now verify Tier 2 RolloutStepMegaGraph + ZeroSyncPPO end-to-end inside MjlabOnPolicyRunner!
     rl_cfg = load_rl_cfg("Mjlab-Velocity-Flat-Unitree-G1")
@@ -265,9 +270,10 @@ def test_real_velocity_env_tier1_and_tier2_mega_graph_ieee_zero_sync(tmp_path):
       wrapped, agent_cfg, log_dir=str(tmp_path), device="cuda:0"
     )
     assert runner._rollout_mega_graph is None
+    raw_actor: Any = runner.alg._raw_actor
     std_ptr_before = (
-      runner.alg._raw_actor.obs_normalizer._std.data_ptr()
-      if getattr(runner.alg._raw_actor, "obs_normalization", False)
+      cast(torch.Tensor, raw_actor.obs_normalizer._std).data_ptr()
+      if getattr(raw_actor, "obs_normalization", False)
       else None
     )
     runner.learn(num_learning_iterations=3, init_at_random_ep_len=True)
@@ -275,7 +281,9 @@ def test_real_velocity_env_tier1_and_tier2_mega_graph_ieee_zero_sync(tmp_path):
     assert runner._rollout_mega_graph.captures == 1
     assert runner._rollout_mega_graph.replays >= 22
     if std_ptr_before is not None:
-      assert runner.alg._raw_actor.obs_normalizer._std.data_ptr() == std_ptr_before
+      assert (
+        cast(torch.Tensor, raw_actor.obs_normalizer._std).data_ptr() == std_ptr_before
+      )
   finally:
     env.close()
 
@@ -478,6 +486,7 @@ def test_real_tracking_env_async_reset_pool_and_mega_graph(tmp_path):
     assert runner._rollout_mega_graph.captures == 1
     assert runner._rollout_mega_graph.replays >= 22
     assert pool.refill_count >= 1
+    assert motion_cmd is not None
     assert float(motion_cmd.metrics["sampling_entropy"].mean().item()) > 0.0
   finally:
     env.close()
@@ -539,7 +548,8 @@ def test_curriculum_stage_transition_recaptures_mega_graph(tmp_path):
       wrapped, agent_cfg, log_dir=str(tmp_path), device="cuda:0"
     )
     runner.learn(num_learning_iterations=4, init_at_random_ep_len=False)
-    cmd_term = env.command_manager.get_term("twist")
+    cmd_term = cast(Any, env.command_manager.get_term("twist"))
+    assert cmd_term is not None
     assert cmd_term.cfg.ranges.lin_vel_x == (-1.5, 1.5)
     assert runner._rollout_mega_graph is not None
     # Initial capture at stage 0 + automatic re-capture once stage 1 activates!
@@ -806,7 +816,10 @@ def test_env_full_step_graph_matches_stock_physics_without_root_rewind():
       max_q = max(max_q, (e_ref.sim.data.qpos - e_mg.sim.data.qpos).abs().max().item())
       max_v = max(max_v, (e_ref.sim.data.qvel - e_mg.sim.data.qvel).abs().max().item())
       max_r = max(max_r, (r1 - r2).abs().max().item())
-      max_o = max(max_o, (o1["actor"] - o2["actor"]).abs().max().item())
+      o1_actor = o1["actor"]
+      o2_actor = o2["actor"]
+      assert isinstance(o1_actor, torch.Tensor) and isinstance(o2_actor, torch.Tensor)
+      max_o = max(max_o, (o1_actor - o2_actor).abs().max().item())
 
     # Before the write_root_*_masked fix, qpos drifted >0.6 and qvel >9.0 in 1 step!
     assert e_mg._mega_step_graph is not None and e_mg._mega_step_graph.captures == 1

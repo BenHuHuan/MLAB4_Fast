@@ -912,10 +912,15 @@ class Entity:
     """Branchless CUDA-Graph-safe reset using a boolean mask of shape ``(num_envs,)``."""
     self._data.clear_state_masked(reset_mask)
     for act in self._actuators:
-      if hasattr(act, "reset_masked"):
-        act.reset_masked(reset_mask)
-      elif getattr(act, "_delay_buffer", None) is not None:
-        act._delay_buffer.reset_masked(reset_mask)
+      reset_fn = getattr(act, "reset_masked", None)
+      if callable(reset_fn):
+        reset_fn(reset_mask)
+      else:
+        delay_buf = getattr(act, "_delay_buffer", None)
+        if delay_buf is not None:
+          delay_reset_fn = getattr(delay_buf, "reset_masked", None)
+          if callable(delay_reset_fn):
+            delay_reset_fn(reset_mask)
 
   def clear_state(self, env_ids: torch.Tensor | slice | None = None) -> None:
     """Deprecated. Use ``reset`` instead."""

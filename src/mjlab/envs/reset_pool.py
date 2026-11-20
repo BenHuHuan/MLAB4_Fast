@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 
 import numpy as np
 import torch
@@ -250,7 +250,7 @@ class AsyncResetPool:
         target = (
           stream if stream is not None else torch.cuda.current_stream(self.device)
         )
-        target.wait_event(self._copy_done_event)  # type: ignore[arg-type]
+        target.wait_event(cast(Any, self._copy_done_event))
 
   def close(self) -> None:
     if self._closed:

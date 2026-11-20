@@ -2,7 +2,7 @@ import functools
 import gc
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mujoco
 import numpy as np
@@ -270,8 +270,8 @@ class ManagerBasedRlEnv:
         zero_sync_metrics=bool(getattr(cfg, "_use_zero_sync_optimizations", True)),
         kinematic_forward=True,
         substep_graph=bool(getattr(cfg, "_use_substep_cuda_graph", True)),
-        mega_graph_mode=str(getattr(cfg, "_mega_graph_mode", "off")),
-        reset_pool_mode=str(getattr(cfg, "_reset_pool_mode", "off")),
+        mega_graph_mode=str(getattr(cfg, "_mega_graph_mode", "env")),
+        reset_pool_mode=str(getattr(cfg, "_reset_pool_mode", "auto")),
       )
 
   # Properties.
@@ -873,12 +873,12 @@ class ManagerBasedRlEnv:
       self._decimation_substep_runner = None
 
     eff_mega = (
-      str(getattr(self.cfg, "_mega_graph_mode", "off"))
+      str(getattr(self.cfg, "_mega_graph_mode", "env"))
       if mega_graph_mode is None
       else str(mega_graph_mode)
     )
     eff_pool = (
-      str(getattr(self.cfg, "_reset_pool_mode", "off"))
+      str(getattr(self.cfg, "_reset_pool_mode", "auto"))
       if reset_pool_mode is None
       else str(reset_pool_mode)
     )
@@ -915,7 +915,12 @@ class ManagerBasedRlEnv:
                 )
                 cmd_term._async_reset_pool = pool  # type: ignore[attr-defined]
                 pools.append(
-                  (pool, lambda _c=cmd_term: _c.bin_failed_count.detach().cpu().numpy())
+                  (
+                    pool,
+                    lambda _c=cmd_term: (
+                      cast(Any, _c).bin_failed_count.detach().cpu().numpy()
+                    ),
+                  )
                 )
           self._mega_step_graph = EnvFullStepGraph(self, reset_pools=pools)
       else:

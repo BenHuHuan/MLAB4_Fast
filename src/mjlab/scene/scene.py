@@ -199,8 +199,9 @@ class Scene:
       if hasattr(ent, "reset_masked"):
         ent.reset_masked(reset_mask)
     for sensor in self._sensors.values():
-      if hasattr(sensor, "reset_masked"):
-        sensor.reset_masked(reset_mask)
+      reset_fn = getattr(sensor, "reset_masked", None)
+      if callable(reset_fn):
+        reset_fn(reset_mask)
       else:
         sensor._invalidate_cache()
 

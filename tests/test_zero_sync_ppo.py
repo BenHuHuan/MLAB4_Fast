@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import warnings
+from typing import Any, cast
 
 import pytest
 import torch
@@ -68,7 +69,7 @@ def _build_ppo_pair(
   storage_ref = RolloutStorage("rl", num_envs, num_steps, obs, [act_dim], device)
   storage_zs = RolloutStorage("rl", num_envs, num_steps, obs, [act_dim], device)
 
-  common = dict(
+  common: dict[str, Any] = dict(
     num_learning_epochs=3,
     num_mini_batches=4,
     learning_rate=3e-4,
@@ -85,6 +86,9 @@ def _build_ppo_pair(
     for _ in range(num_steps):
       step_obs = _make_dummy_obs(num_envs, obs_dim, device)
       act = alg_ref.act(step_obs)
+      assert alg_ref.transition.values is not None
+      assert alg_ref.transition.actions_log_prob is not None
+      assert alg_ref.transition.distribution_params is not None
       alg_zs.transition.hidden_states = alg_ref.transition.hidden_states
       alg_zs.transition.actions = act.clone()
       alg_zs.transition.values = alg_ref.transition.values.clone()
@@ -113,8 +117,15 @@ def test_zero_sync_ppo_ieee_fp32_parity_and_single_sync_guard():
     alg_ref, alg_zs = _build_ppo_pair(device="cuda", obs_norm=True)
     assert alg_zs.zero_sync_update is True
 
-    actor_std_ptr_before = alg_zs._raw_actor.obs_normalizer._std.data_ptr()
-    critic_std_ptr_before = alg_zs._raw_critic.obs_normalizer._std.data_ptr()
+    raw_actor_zs: Any = alg_zs._raw_actor
+    raw_critic_zs: Any = alg_zs._raw_critic
+    raw_actor_ref: Any = alg_ref._raw_actor
+    actor_std_ptr_before = cast(
+      torch.Tensor, raw_actor_zs.obs_normalizer._std
+    ).data_ptr()
+    critic_std_ptr_before = cast(
+      torch.Tensor, raw_critic_zs.obs_normalizer._std
+    ).data_ptr()
 
     # Run reference PPO update
     torch.manual_seed(42)
@@ -144,11 +155,17 @@ def test_zero_sync_ppo_ieee_fp32_parity_and_single_sync_guard():
     assert alg_zs.learning_rate == alg_ref.learning_rate
 
     # In-place normalizer _std data_ptr preserved for CUDA Graph replay!
-    assert alg_zs._raw_actor.obs_normalizer._std.data_ptr() == actor_std_ptr_before
-    assert alg_zs._raw_critic.obs_normalizer._std.data_ptr() == critic_std_ptr_before
+    assert (
+      cast(torch.Tensor, raw_actor_zs.obs_normalizer._std).data_ptr()
+      == actor_std_ptr_before
+    )
+    assert (
+      cast(torch.Tensor, raw_critic_zs.obs_normalizer._std).data_ptr()
+      == critic_std_ptr_before
+    )
     torch.testing.assert_close(
-      alg_zs._raw_actor.obs_normalizer._std,
-      alg_ref._raw_actor.obs_normalizer._std,
+      cast(torch.Tensor, raw_actor_zs.obs_normalizer._std),
+      cast(torch.Tensor, raw_actor_ref.obs_normalizer._std),
       rtol=1e-6,
       atol=1e-6,
     )
@@ -177,6 +194,7 @@ def test_zero_sync_ppo_fail_closed_found_inf_and_checkpoint_compat():
 
   # 1. Checkpoint round-trip: ZeroSyncPPO -> vanilla PPO -> ZeroSyncPPO
   alg_zs.learning_rate = 1.2345e-4
+  assert alg_zs._lr_fp64 is not None and alg_zs._lr_gpu is not None
   alg_zs._lr_fp64.fill_(alg_zs.learning_rate)
   alg_zs._lr_gpu.fill_(alg_zs.learning_rate)
   ckpt = alg_zs.save()
@@ -190,6 +208,7 @@ def test_zero_sync_ppo_fail_closed_found_inf_and_checkpoint_compat():
   alg_zs2.load(ckpt, load_cfg=None, strict=True)
   assert abs(alg_zs2.learning_rate - 1.2345e-4) < 1e-12
   assert alg_zs2.optimizer.param_groups[0]["lr"] is alg_zs2._lr_gpu
+  assert alg_zs2._lr_fp64 is not None
   assert abs(float(alg_zs2._lr_fp64.item()) - 1.2345e-4) < 1e-12
 
   # 2. Fail-closed found_inf protection: poison storage returns with NaN -> weights untouched!
@@ -209,20 +228,24 @@ def test_inplace_empirical_normalizer_until_and_pointer():
   from rsl_rl.modules import EmpiricalNormalization
 
   norm = EmpiricalNormalization(12, until=16).cuda()
-  std_ptr = norm._std.data_ptr()
-  cache: dict = {}
+  norm_any: Any = norm
+  norm_count: torch.Tensor = norm_any.count
+  norm_mean: torch.Tensor = norm_any._mean
+  norm_std: torch.Tensor = norm_any._std
+  std_ptr = norm_std.data_ptr()
+  cache: dict[tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
   update_empirical_normalizer_inplace(norm, torch.randn(8, 12, device="cuda"), cache)
-  assert int(norm.count.item()) == 8
-  assert norm._std.data_ptr() == std_ptr
+  assert int(norm_count.item()) == 8
+  assert norm_std.data_ptr() == std_ptr
   update_empirical_normalizer_inplace(norm, torch.randn(8, 12, device="cuda"), cache)
-  assert int(norm.count.item()) == 16
-  mean_at_limit = norm._mean.clone()
+  assert int(norm_count.item()) == 16
+  mean_at_limit = norm_mean.clone()
   update_empirical_normalizer_inplace(
     norm, torch.full((8, 12), 100.0, device="cuda"), cache
   )
   # Beyond `until=16`, stats must freeze bit-identically!
-  assert torch.equal(norm._mean, mean_at_limit)
-  assert norm._std.data_ptr() == std_ptr
+  assert torch.equal(norm_mean, mean_at_limit)
+  assert norm_std.data_ptr() == std_ptr
 
 
 def test_bootstrap_cpu_env_multi_gpu_launcher_does_not_pin():

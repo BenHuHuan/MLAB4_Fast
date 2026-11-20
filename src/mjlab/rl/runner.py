@@ -1,6 +1,7 @@
 import os
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import torch
 from rsl_rl.env import VecEnv
@@ -61,10 +62,19 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
           for opt in ("rnn_type", "rnn_hidden_dim", "rnn_num_layers"):
             train_cfg[key].pop(opt, None)
 
-    self._strict_rng_parity: bool = bool(train_cfg.get("strict_rng_parity", False))
+    unwrapped_cfg = getattr(getattr(env, "unwrapped", env), "cfg", None)
+    self._strict_rng_parity: bool = bool(
+      train_cfg.get(
+        "strict_rng_parity",
+        getattr(unwrapped_cfg, "_strict_rng_parity", False),
+      )
+    )
+    default_opt_enabled = (
+      getattr(unwrapped_cfg, "_rollout_optimization_mode", "fp32_exact") != "off"
+    )
     dev_type = torch.device(device).type
     use_zero_sync_ppo = bool(
-      train_cfg.get("zero_sync_ppo", True)
+      train_cfg.get("zero_sync_ppo", default_opt_enabled)
       and not self._strict_rng_parity
       and dev_type == "cuda"
       and torch.cuda.is_available()
@@ -82,7 +92,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     self._cpu_execution_plan = None
     self._batched_logging_enabled: bool = False
     self._zero_sync_rollout: bool = bool(
-      train_cfg.get("zero_sync_rollout", True)
+      train_cfg.get("zero_sync_rollout", default_opt_enabled)
       and not self._strict_rng_parity
       and dev_type == "cuda"
       and torch.cuda.is_available()
@@ -90,9 +100,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     self._mega_graph_mode: str = str(
       train_cfg.get(
         "mega_graph_mode",
-        getattr(getattr(env, "unwrapped", env), "cfg", None)
-        and getattr(getattr(env, "unwrapped", env).cfg, "_mega_graph_mode", "off")
-        or "off",
+        getattr(unwrapped_cfg, "_mega_graph_mode", "off"),
       )
     )
     self._rollout_mega_graph = None
@@ -264,7 +272,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
     num_envs = int(self.env.num_envs)
     has_rnd = bool(self.cfg["algorithm"].get("rnd_cfg"))
     check_nan_enabled = bool(self.cfg.get("check_for_nan", True))
-    unwrapped = getattr(self.env, "unwrapped", self.env)
+    unwrapped: Any = cast(Any, getattr(self.env, "unwrapped", self.env))
 
     # Preallocate zero-sync per-step rollout staging buffers on GPU.
     step_done_buf = torch.empty(
@@ -313,12 +321,15 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
 
       from mjlab.envs.mega_step_graph import RolloutStepMegaGraph
 
+      assert env_graph is not None
       # Bind static obs buffers from current env.obs_buf without advancing history or noise.
       static_obs_dict = unwrapped.observation_manager.init_static_obs_buffer(
         unwrapped.obs_buf
       )
       obs = TensorDict(static_obs_dict, batch_size=[num_envs])
       actor = self.alg.actor
+      actor_dist = actor.distribution
+      assert actor_dist is not None
       critic = self.alg.critic
       clip_act = getattr(self.env, "clip_actions", None)
       is_finite_horizon = bool(getattr(unwrapped.cfg, "is_finite_horizon", False))
@@ -328,7 +339,7 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
       with torch.no_grad():
         _lat0 = actor.get_latent(obs, None, None)
         _mlp0 = actor.mlp(_lat0)
-        actor.distribution.update(_mlp0)
+        actor_dist.update(_mlp0)
         _dparams0 = tuple(p.detach().clone() for p in actor.output_distribution_params)
         _val0 = critic(obs).detach().clone()
         _act0 = torch.empty_like(actor.output_mean)
@@ -349,11 +360,11 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
       def _tier2_step_body() -> None:
         # 1. Snapshot pre-step obs before EnvFullStepGraph mutates static_obs_dict in-place.
         for k in stg_pre_obs.keys():
-          stg_pre_obs[k].copy_(obs[k])
+          cast(torch.Tensor, stg_pre_obs[k]).copy_(cast(torch.Tensor, obs[k]))
         # 2. Actor + Critic forward & CUDA-Graph-safe Philox sampling.
         lat = actor.get_latent(obs, None, None)
         mlp_out = actor.mlp(lat)
-        actor.distribution.update(mlp_out)
+        actor_dist.update(mlp_out)
         act_sample = (
           actor.output_mean + torch.randn_like(actor.output_mean) * actor.output_std
         )
@@ -562,16 +573,25 @@ class MjlabOnPolicyRunner(OnPolicyRunner):
         loss_dict=loss_dict,
         learning_rate=self.alg.learning_rate,
         action_std=self.alg.get_policy().output_std,
-        rnd_weight=self.alg.rnd.weight if has_rnd else None,
+        rnd_weight=(
+          self.alg.rnd.weight if (has_rnd and self.alg.rnd is not None) else None
+        ),
       )
 
-      if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:
-        self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))  # type: ignore[arg-type]
+      if (
+        self.logger.writer is not None
+        and self.logger.log_dir is not None
+        and it % self.cfg["save_interval"] == 0
+      ):
+        self.save(os.path.join(self.logger.log_dir, f"model_{it}.pt"))
 
     if self.logger.writer is not None:
-      self.save(
-        os.path.join(self.logger.log_dir, f"model_{self.current_learning_iteration}.pt")
-      )  # type: ignore[arg-type]
+      if self.logger.log_dir is not None:
+        self.save(
+          os.path.join(
+            self.logger.log_dir, f"model_{self.current_learning_iteration}.pt"
+          )
+        )
       self.logger.stop_logging_writer()
 
   def export_policy_to_onnx(

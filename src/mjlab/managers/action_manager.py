@@ -156,8 +156,9 @@ class ActionManager(ManagerBase):
     self._prev_prev_action.masked_fill_(m2, 0.0)
     self._action.masked_fill_(m2, 0.0)
     for term in self._terms.values():
-      if hasattr(term, "reset_masked"):
-        term.reset_masked(reset_mask)
+      reset_fn = getattr(term, "reset_masked", None)
+      if callable(reset_fn):
+        reset_fn(reset_mask)
       else:
         term.reset(env_ids=reset_mask)
 

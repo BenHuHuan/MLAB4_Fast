@@ -188,10 +188,13 @@ def run_train(task_id: str, cfg: TrainConfig, log_dir: Path) -> None:
         reset_pool_mode=resolved["reset_pool_mode"],
       )
     else:
-      configure_fp32_exact(cfg.env, enabled=True)
-      cfg.env._strict_rng_parity = resolved["strict_rng_parity"]  # type: ignore[attr-defined]
-      cfg.env._mega_graph_mode = resolved["mega_graph_mode"]  # type: ignore[attr-defined]
-      cfg.env._reset_pool_mode = resolved["reset_pool_mode"]  # type: ignore[attr-defined]
+      configure_fp32_exact(
+        cfg.env,
+        enabled=True,
+        strict_rng_parity=resolved["strict_rng_parity"],
+        mega_graph_mode=resolved["mega_graph_mode"],
+        reset_pool_mode=resolved["reset_pool_mode"],
+      )
 
   if cfg.cpu_optimizations:
     plan = partition_server_cpus(

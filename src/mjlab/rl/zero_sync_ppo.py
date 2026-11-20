@@ -16,14 +16,17 @@ Eliminates all per-minibatch GPU<->CPU synchronizations inside ``PPO.update()``:
 from __future__ import annotations
 
 from itertools import chain
-from typing import Any
+from typing import Any, cast
 
 import torch
+import torch.distributed as _torch_dist
 import torch.nn as nn
 from rsl_rl.algorithms import PPO
 from rsl_rl.modules import EmpiricalNormalization
 from rsl_rl.utils import unpad_trajectories
 from tensordict import TensorDict
+
+_dist: Any = _torch_dist
 
 
 def export_compatible_adam_state_dict(
@@ -107,50 +110,55 @@ def update_empirical_normalizer_inplace(
   if not norm.training:
     return
 
-  dev = norm.count.device
-  dtype_c = norm.count.dtype
+  norm_any: Any = norm
+  count: torch.Tensor = norm_any.count
+  mean: torch.Tensor = norm_any._mean
+  var: torch.Tensor = norm_any._var
+  std: torch.Tensor = norm_any._std
+
+  dev = count.device
+  dtype_c = count.dtype
   batch_n = int(x.shape[0])
+  dist_init = bool(_dist.is_available() and _dist.is_initialized())
   if count_cache is not None:
     key = (batch_n, dtype_c, dev)
     count_x_base = count_cache.get(key)
     if count_x_base is None:
       count_x_base = torch.tensor(batch_n, dtype=dtype_c, device=dev)
       count_cache[key] = count_x_base
-    count_x = (
-      count_x_base.clone() if torch.distributed.is_initialized() else count_x_base
-    )
+    count_x = count_x_base.clone() if dist_init else count_x_base
   else:
     count_x = torch.tensor(batch_n, dtype=dtype_c, device=dev)
 
   var_x = torch.var(x, dim=0, unbiased=False, keepdim=True)
   mean_x = torch.mean(x, dim=0, keepdim=True)
 
-  if torch.distributed.is_initialized():
+  if dist_init:
     local_mean_x = mean_x
-    torch.distributed.all_reduce(count_x)
+    _dist.all_reduce(count_x)
     mean_sum_x = mean_x * batch_n
-    torch.distributed.all_reduce(mean_sum_x)
+    _dist.all_reduce(mean_sum_x)
     mean_x = mean_sum_x / count_x
     var_sum_x = batch_n * (var_x + (local_mean_x - mean_x).square())
-    torch.distributed.all_reduce(var_sum_x)
+    _dist.all_reduce(var_sum_x)
     var_x = var_sum_x / count_x
 
   if norm.until is not None:
-    active_i = (norm.count < norm.until).to(dtype=dtype_c)
-    active_f = active_i.to(dtype=norm._mean.dtype)
+    active_i = count.lt(norm.until).to(dtype=dtype_c)
+    active_f = active_i.to(dtype=mean.dtype)
     eff_count_x = count_x * active_i
-    new_count = norm.count + eff_count_x
+    new_count = count + eff_count_x
     denom = new_count.clamp_min(1)
-    rate = (eff_count_x / denom).to(dtype=norm._mean.dtype) * active_f
-    norm.count.copy_(new_count)
+    rate = (eff_count_x / denom).to(dtype=mean.dtype) * active_f
+    count.copy_(new_count)
   else:
-    norm.count.add_(count_x)
-    rate = (count_x / norm.count).to(dtype=norm._mean.dtype)
+    count.add_(count_x)
+    rate = (count_x / count).to(dtype=mean.dtype)
 
-  delta_mean = mean_x - norm._mean
-  norm._mean.add_(rate * delta_mean)
-  norm._var.add_(rate * (var_x - norm._var + delta_mean * (mean_x - norm._mean)))
-  torch.sqrt(norm._var, out=norm._std)
+  delta_mean = mean_x - mean
+  mean.add_(rate * delta_mean)
+  var.add_(rate * (var_x - var + delta_mean * (mean_x - mean)))
+  torch.sqrt(var, out=std)
 
 
 class ZeroSyncPPO(PPO):
@@ -215,20 +223,22 @@ class ZeroSyncPPO(PPO):
     """Refresh actor distribution parameters for PPO update without wasted RNG sampling."""
     actor = self.actor
     is_compiled = type(actor).__name__ == "OptimizedModule"
+    actor_dist = getattr(actor, "distribution", None)
     if (
       not is_compiled
-      and getattr(actor, "distribution", None) is not None
+      and actor_dist is not None
       and hasattr(actor, "get_latent")
       and hasattr(actor, "mlp")
     ):
-      obs_in = (
+      obs_in = cast(
+        TensorDict,
         unpad_trajectories(obs, masks)
         if masks is not None and not actor.is_recurrent
-        else obs
+        else obs,
       )
       latent = actor.get_latent(obs_in, masks, hidden_state)
       mlp_output = actor.mlp(latent)
-      actor.distribution.update(mlp_output)
+      actor_dist.update(mlp_output)
     else:
       actor(
         obs,
@@ -245,8 +255,10 @@ class ZeroSyncPPO(PPO):
     norm = getattr(model, "obs_normalizer", None)
     obs_groups = getattr(model, "obs_groups", None)
     if isinstance(norm, EmpiricalNormalization) and obs_groups is not None:
-      obs_list = [obs[g] for g in obs_groups]
-      mlp_obs = obs_list[0] if len(obs_list) == 1 else torch.cat(obs_list, dim=-1)
+      obs_list: list[torch.Tensor] = [cast(torch.Tensor, obs[g]) for g in obs_groups]
+      mlp_obs: torch.Tensor = (
+        obs_list[0] if len(obs_list) == 1 else torch.cat(obs_list, dim=-1)
+      )
       update_empirical_normalizer_inplace(norm, mlp_obs, self._norm_count_cache)
     elif hasattr(model, "update_normalization"):
       model.update_normalization(obs)  # type: ignore[operator]
@@ -284,30 +296,35 @@ class ZeroSyncPPO(PPO):
       )
 
     for batch in generator:
-      original_batch_size = batch.observations.batch_size[0]
+      batch_obs = batch.observations
+      assert batch_obs is not None
+      original_batch_size = batch_obs.batch_size[0]
 
       if self.normalize_advantage_per_mini_batch:
+        assert batch.advantages is not None
         with torch.no_grad():
           batch.advantages = (batch.advantages - batch.advantages.mean()) / (
             batch.advantages.std() + 1e-8
-          )  # type: ignore[operator]
+          )
 
       if self.symmetry:
         self.symmetry.augment_batch(batch, original_batch_size)
+        batch_obs = batch.observations
+        assert batch_obs is not None
 
-      with torch.amp.autocast(  # type: ignore[attr-defined]
+      with torch.autocast(
         device_type=dev.type,
         enabled=self.use_mixed_precision,
         dtype=torch.bfloat16,
       ):
         self._update_actor_distribution_no_sample(
-          batch.observations,
+          batch_obs,
           masks=batch.masks,
           hidden_state=batch.hidden_states[0],
         )
         actions_log_prob = self.actor.get_output_log_prob(batch.actions)  # type: ignore[arg-type]
         values = self.critic(
-          batch.observations,
+          batch_obs,
           masks=batch.masks,
           hidden_state=batch.hidden_states[1],
         )
@@ -318,13 +335,14 @@ class ZeroSyncPPO(PPO):
 
         # GPU-resident exact float64->float32 adaptive KL schedule (zero host sync).
         if self.desired_kl is not None and self.schedule == "adaptive":
+          assert batch.old_distribution_params is not None
           with torch.inference_mode():
             kl = self.actor.get_kl_divergence(
               batch.old_distribution_params, distribution_params
-            )  # type: ignore[arg-type]
+            )
             kl_mean = torch.mean(kl)
             if self.is_multi_gpu:
-              torch.distributed.all_reduce(kl_mean, op=torch.distributed.ReduceOp.SUM)
+              _dist.all_reduce(kl_mean, op=_dist.ReduceOp.SUM)
               kl_mean.div_(self.gpu_world_size)
             if not self.is_multi_gpu or self.gpu_global_rank == 0:
               hi = kl_mean > (self.desired_kl * 2.0)
@@ -343,7 +361,7 @@ class ZeroSyncPPO(PPO):
               self._lr_fp64.copy_(next_lr)
             if self.is_multi_gpu:
               # Zero-sync 8-byte GPU broadcast eliminates cross-rank 1-ULP LR divergence.
-              torch.distributed.broadcast(self._lr_fp64, src=0)
+              _dist.broadcast(self._lr_fp64, src=0)
             self._lr_gpu.copy_(self._lr_fp64.to(torch.float32))
 
         # Surrogate loss
@@ -373,7 +391,7 @@ class ZeroSyncPPO(PPO):
         )
 
         rnd_loss = (
-          self.rnd.compute_loss(batch.observations[:original_batch_size])
+          self.rnd.compute_loss(cast(TensorDict, batch_obs[:original_batch_size]))
           if self.rnd is not None
           else None
         )
@@ -430,7 +448,7 @@ class ZeroSyncPPO(PPO):
     self._update_model_normalization_inplace(self._raw_actor, obs)
     self._update_model_normalization_inplace(self._raw_critic, obs)
     if self.rnd is not None:
-      self.rnd.update_normalization(obs)  # type: ignore[arg-type]
+      self.rnd.update_normalization(obs)
 
     num_updates = self.num_learning_epochs * self.num_mini_batches
     means_gpu = (metrics_accum / float(num_updates)).to(torch.float64)

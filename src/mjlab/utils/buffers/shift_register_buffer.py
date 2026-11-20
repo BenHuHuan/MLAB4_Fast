@@ -18,12 +18,12 @@ import warp as wp
 
 @wp.kernel
 def _shift_reg_append_masked_f32(
-  buf: wp.array3d(dtype=float),
-  frame: wp.array2d(dtype=float),
-  reset_mask: wp.array(dtype=wp.bool),
+  buf: wp.array3d(dtype=float),  # type: ignore[valid-type]
+  frame: wp.array2d(dtype=float),  # type: ignore[valid-type]
+  reset_mask: wp.array(dtype=wp.bool),  # type: ignore[valid-type]
   max_len: int,
 ):
-  n, d = wp.tid()
+  n, d = wp.tid()  # type: ignore[attr-defined]
   val = frame[n, d]
   if reset_mask[n]:
     for h in range(max_len):
@@ -36,17 +36,17 @@ def _shift_reg_append_masked_f32(
 
 @wp.kernel
 def _shift_reg_append_with_sdk_bank_f32(
-  buf: wp.array3d(dtype=float),
-  frame: wp.array2d(dtype=float),
-  reset_mask: wp.array(dtype=wp.bool),
-  is_sdk_bank: wp.array(dtype=wp.bool),
-  bank_row_id: wp.array(dtype=wp.int32),
-  sdk_hist: wp.array3d(dtype=float),
+  buf: wp.array3d(dtype=float),  # type: ignore[valid-type]
+  frame: wp.array2d(dtype=float),  # type: ignore[valid-type]
+  reset_mask: wp.array(dtype=wp.bool),  # type: ignore[valid-type]
+  is_sdk_bank: wp.array(dtype=wp.bool),  # type: ignore[valid-type]
+  bank_row_id: wp.array(dtype=wp.int32),  # type: ignore[valid-type]
+  sdk_hist: wp.array3d(dtype=float),  # type: ignore[valid-type]
   max_len: int,
   feat_dim: int,
   preserve_tail_cols: int,
 ):
-  n, d = wp.tid()
+  n, d = wp.tid()  # type: ignore[attr-defined]
   val = frame[n, d]
   if is_sdk_bank[n]:
     if preserve_tail_cols > 0 and d >= (feat_dim - preserve_tail_cols):
