@@ -853,24 +853,23 @@ class RayCastSensor(Sensor[RayCastData]):
     x_proj[:, 2] = 0  # Zero out Z component
     x_norm = x_proj.norm(dim=1)  # [B]
 
-    # Check for singularity (X-axis nearly vertical).
+    # Check for singularity (X-axis nearly vertical) branchlessly so
+    # RayCastSensor never triggers a D2H sync and is CUDA-Graph capturable.
     threshold = 0.1
     singular = x_norm < threshold  # [B]
 
-    # For singular cases, use Y-axis instead.
-    if singular.any():
-      y_axis = rot_mat[:, :, 1]  # Second column [B, 3]
-      y_proj = y_axis.clone()
-      y_proj[:, 2] = 0
-      y_norm = y_proj.norm(dim=1).clamp(min=1e-6)
-      y_proj = y_proj / y_norm.unsqueeze(-1)
-      # Y-axis points left; rotate -90° around Z to get forward direction.
-      # [y_x, y_y] -> [y_y, -y_x]
-      x_from_y = torch.zeros_like(y_proj)
-      x_from_y[:, 0] = y_proj[:, 1]
-      x_from_y[:, 1] = -y_proj[:, 0]
-      x_proj[singular] = x_from_y[singular]
-      x_norm[singular] = 1.0  # Already normalized
+    y_axis = rot_mat[:, :, 1]  # Second column [B, 3]
+    y_proj = y_axis.clone()
+    y_proj[:, 2] = 0
+    y_norm = y_proj.norm(dim=1).clamp(min=1e-6)
+    y_proj = y_proj / y_norm.unsqueeze(-1)
+    # Y-axis points left; rotate -90° around Z to get forward direction.
+    # [y_x, y_y] -> [y_y, -y_x]
+    x_from_y = torch.zeros_like(y_proj)
+    x_from_y[:, 0] = y_proj[:, 1]
+    x_from_y[:, 1] = -y_proj[:, 0]
+    x_proj = torch.where(singular.unsqueeze(-1), x_from_y, x_proj)
+    x_norm = torch.where(singular, torch.ones_like(x_norm), x_norm)
 
     # Normalize X projection.
     x_norm = x_norm.clamp(min=1e-6)

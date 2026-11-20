@@ -17,12 +17,15 @@ Compared with UniLab's ``cpu_runtime.py`` + ``distributed/affinity.py``, this mo
 
 from __future__ import annotations
 
+import atexit
 import os
+import struct
 import threading
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, MutableMapping, Sequence
 
 _SYS_CPU_ROOT = Path("/sys/devices/system/cpu")
 _SYS_NODE_ROOT = Path("/sys/devices/system/node")
@@ -35,6 +38,23 @@ _HYBRID_FREQ_RATIO = 0.85
 _LOCK = threading.Lock()
 _ACTIVE_PLAN: CpuExecutionPlan | None = None
 _REGISTERED_WORKER_TIDS: set[int] = set()
+_INITIAL_ALLOWED_CPUS: tuple[int, ...] | None = None
+_DMA_LATENCY_FD: int | None = None
+_WARNED_POWERSAVE: bool = False
+
+
+def _close_dma_latency_fd() -> None:
+  global _DMA_LATENCY_FD
+  fd = _DMA_LATENCY_FD
+  _DMA_LATENCY_FD = None
+  if fd is not None:
+    try:
+      os.close(fd)
+    except OSError:
+      pass
+
+
+atexit.register(_close_dma_latency_fd)
 
 
 @dataclass(frozen=True)
@@ -100,6 +120,9 @@ class CpuExecutionPlan:
   worker_io_cpu_ids: tuple[int, ...] = ()
   worker_performance_cores: int = 0
   llc_domains: tuple[int, ...] = ()
+  main_thread_cpu_id: int = 0
+  driver_primary_cpu_ids: tuple[int, ...] = ()
+  worker_reset_pool_cpu_ids: tuple[int, ...] = ()
 
   def to_dict(self) -> dict[str, object]:
     return {
@@ -112,10 +135,13 @@ class CpuExecutionPlan:
       "driver_physical_cores": self.driver_physical_cores,
       "worker_physical_cores": self.worker_physical_cores,
       "worker_performance_cores": self.worker_performance_cores,
+      "main_thread_cpu_id": self.main_thread_cpu_id,
       "driver_cpu_ids": list(self.driver_cpu_ids),
+      "driver_primary_cpu_ids": list(self.driver_primary_cpu_ids),
       "worker_cpu_ids": list(self.worker_cpu_ids),
       "worker_compute_cpu_ids": list(self.worker_compute_cpu_ids),
       "worker_io_cpu_ids": list(self.worker_io_cpu_ids),
+      "worker_reset_pool_cpu_ids": list(self.worker_reset_pool_cpu_ids),
       "disjoint_driver_and_worker": bool(
         set(self.driver_cpu_ids).isdisjoint(self.worker_cpu_ids)
       ),
@@ -153,7 +179,99 @@ def _read_int(path: Path, default: int) -> int:
     return default
 
 
-def _allowed_logical_cpus() -> tuple[int, ...]:
+def _read_str(path: Path, default: str | None = None) -> str | None:
+  try:
+    val = path.read_text(encoding="utf-8").strip()
+    return val if val else default
+  except OSError:
+    return default
+
+
+def _detect_cuda_numa_node_sysfs(
+  local_rank: int = 0,
+  *,
+  sys_pci_root: Path = _SYS_PCI_ROOT,
+  env: MutableMapping[str, str] | None = None,
+) -> int | None:
+  """Detect GPU PCIe NUMA node strictly via Linux sysfs without importing torch."""
+  env_map = os.environ if env is None else env
+  cuda_vis = env_map.get("CUDA_VISIBLE_DEVICES")
+  if cuda_vis is not None and cuda_vis.strip() == "":
+    return None
+  if not sys_pci_root.is_dir():
+    return None
+
+  nvidia_gpus: list[Path] = []
+  try:
+    for entry in sorted(sys_pci_root.iterdir()):
+      vendor = _read_str(entry / "vendor")
+      if vendor is None or vendor.lower() != "0x10de":
+        continue
+      pci_class = (_read_str(entry / "class") or "").lower()
+      # 0x0300xx = VGA controller, 0x0302xx = 3D controller (datacenter GPUs)
+      if pci_class.startswith(("0x0300", "0x0302")):
+        nvidia_gpus.append(entry)
+  except OSError:
+    return None
+
+  if not nvidia_gpus:
+    return None
+
+  target_idx = max(0, int(local_rank))
+  if cuda_vis:
+    tokens = [t.strip() for t in cuda_vis.split(",") if t.strip()]
+    if tokens and target_idx < len(tokens) and tokens[target_idx].isdigit():
+      target_idx = int(tokens[target_idx])
+  if target_idx >= len(nvidia_gpus):
+    target_idx = 0
+
+  raw = _read_int(nvidia_gpus[target_idx] / "numa_node", -1)
+  return raw if raw >= 0 else None
+
+
+def probe_cpufreq_telemetry(
+  cpu_id: int,
+  *,
+  sys_cpu_root: Path = _SYS_CPU_ROOT,
+) -> dict[str, object]:
+  """Read Linux cpufreq governor, EPP, and min/max/current frequency for ``cpu_id``."""
+  cpufreq_dir = sys_cpu_root / f"cpu{int(cpu_id)}" / "cpufreq"
+  return {
+    "cpu_id": int(cpu_id),
+    "scaling_governor": _read_str(cpufreq_dir / "scaling_governor"),
+    "scaling_driver": _read_str(cpufreq_dir / "scaling_driver"),
+    "energy_performance_preference": _read_str(
+      cpufreq_dir / "energy_performance_preference"
+    ),
+    "cpuinfo_min_freq_khz": _read_int(cpufreq_dir / "cpuinfo_min_freq", 0),
+    "cpuinfo_max_freq_khz": _read_int(cpufreq_dir / "cpuinfo_max_freq", 0),
+    "scaling_cur_freq_khz": _read_int(cpufreq_dir / "scaling_cur_freq", 0),
+  }
+
+
+def try_lock_cpu_dma_latency(latency_us: int = 0) -> bool:
+  """Best-effort hold on ``/dev/cpu_dma_latency`` to prevent deep C-states (no-op without perms)."""
+  global _DMA_LATENCY_FD
+  with _LOCK:
+    if _DMA_LATENCY_FD is not None:
+      return True
+    try:
+      fd = os.open("/dev/cpu_dma_latency", os.O_WRONLY)
+    except OSError:
+      return False
+    try:
+      os.write(fd, struct.pack("i", max(0, int(latency_us))))
+    except OSError:
+      try:
+        os.close(fd)
+      except OSError:
+        pass
+      return False
+    _DMA_LATENCY_FD = fd
+    return True
+
+
+def _query_os_allowed_cpus() -> tuple[int, ...]:
   if hasattr(os, "sched_getaffinity"):
     try:
       cpus = sorted(os.sched_getaffinity(0))
@@ -163,6 +281,20 @@ def _allowed_logical_cpus() -> tuple[int, ...]:
       pass
   count = os.cpu_count() or 1
   return tuple(range(count))
+
+
+def _allowed_logical_cpus() -> tuple[int, ...]:
+  if _INITIAL_ALLOWED_CPUS is not None:
+    return _INITIAL_ALLOWED_CPUS
+  return _query_os_allowed_cpus()
+
+
+def _snapshot_initial_allowed_cpus() -> tuple[int, ...]:
+  global _INITIAL_ALLOWED_CPUS
+  with _LOCK:
+    if _INITIAL_ALLOWED_CPUS is None:
+      _INITIAL_ALLOWED_CPUS = _query_os_allowed_cpus()
+    return _INITIAL_ALLOWED_CPUS
 
 
 def _discover_cpu_to_numa(
@@ -511,9 +643,33 @@ def partition_server_cpus(
 
   rank_cpus = tuple(sorted(cid for g in rank_groups for cid in g.cpu_ids))
   driver_cpus = tuple(sorted(cid for g in drv_groups for cid in g.cpu_ids))
+  driver_primary_cpus = tuple(g.cpu_ids[0] for g in drv_groups)
+  main_thread_cpu = (
+    driver_primary_cpus[0]
+    if driver_primary_cpus
+    else (driver_cpus[0] if driver_cpus else 0)
+  )
   worker_cpus = tuple(sorted(cid for g in wrk_groups for cid in g.cpu_ids))
   llc_domains = tuple(sorted({g.llc_id for g in rank_groups}))
   torch_threads = max(1, min(4, len(drv_groups)))
+
+  # Async reset-pool producer cores: 1..2 primary P-cores on the same NUMA node as GPU
+  # (preferring non-driver LLCs for cache isolation while keeping local-NUMA pinned DMA fast).
+  reset_pool_candidates = sorted(
+    comp_candidates,
+    key=lambda g: (
+      0 if (numa is None or g.numa_node == numa) else 1,
+      0 if g.llc_id not in drv_llcs else 1,
+      -g.max_freq_khz,
+      g.llc_id,
+      g.package_id,
+      g.core_id,
+    ),
+  )
+  n_reset_pool = min(2, len(reset_pool_candidates))
+  worker_reset_pool_cpus = tuple(
+    g.cpu_ids[0] for g in reset_pool_candidates[:n_reset_pool]
+  )
 
   return CpuExecutionPlan(
     rank=int(rank),
@@ -530,7 +686,92 @@ def partition_server_cpus(
     worker_io_cpu_ids=worker_io_cpus,
     worker_performance_cores=len(p_wrk) if p_wrk else len(wrk_groups),
     llc_domains=llc_domains,
+    main_thread_cpu_id=main_thread_cpu,
+    driver_primary_cpu_ids=driver_primary_cpus,
+    worker_reset_pool_cpu_ids=worker_reset_pool_cpus,
   )
+
+
+def bootstrap_cpu_env_before_torch(
+  *,
+  driver_physical_cores: int | None = None,
+  is_multi_gpu_launcher: bool = False,
+  set_affinity: bool = True,
+  topology: CpuTopology | None = None,
+  env: MutableMapping[str, str] | None = None,
+  sys_pci_root: Path = _SYS_PCI_ROOT,
+) -> dict[str, object]:
+  """Stdlib-only CPU/OpenMP bootstrap that MUST run before ``import torch`` / ``numpy``.
+
+  - Sets ``OMP_PROC_BIND=close``, ``OMP_PLACES=cores``, bounded ``OMP_NUM_THREADS`` /
+    ``MKL_NUM_THREADS`` (2..4 matching physical driver cores), ``OPENBLAS_NUM_THREADS=1``,
+    ``NUMEXPR_NUM_THREADS=1``, and ``GOMP_SPINCOUNT=200000`` via ``setdefault`` so explicit
+    user overrides remain respected.
+  - When NOT a multi-GPU parent launcher (single-GPU or worker rank), binds the process to
+    ALL ``driver_primary_cpu_ids`` (never a single core before ``libgomp`` init!) so
+    ``libgomp`` assigns 1-to-1 primary P-cores to the main thread and each OpenMP worker.
+  """
+  env_map = os.environ if env is None else env
+  env_map.setdefault("OMP_PROC_BIND", "close")
+  env_map.setdefault("OMP_PLACES", "cores")
+  env_map.setdefault("OPENBLAS_NUM_THREADS", "1")
+  env_map.setdefault("NUMEXPR_NUM_THREADS", "1")
+  env_map.setdefault("GOMP_SPINCOUNT", "200000")
+
+  if is_multi_gpu_launcher:
+    return {
+      "is_multi_gpu_launcher": True,
+      "applied_affinity": False,
+      "driver_primary_cpu_ids": [],
+      "omp_num_threads": env_map.get("OMP_NUM_THREADS"),
+      "preferred_numa_node": None,
+    }
+
+  world_size = max(1, int(env_map.get("WORLD_SIZE", "1") or "1"))
+  rank = max(0, int(env_map.get("RANK", "0") or "0"))
+  local_rank = max(0, int(env_map.get("LOCAL_RANK", "0") or "0"))
+  local_world_size = max(
+    1, int(env_map.get("LOCAL_WORLD_SIZE", str(world_size)) or str(world_size))
+  )
+  numa = _detect_cuda_numa_node_sysfs(
+    local_rank, sys_pci_root=sys_pci_root, env=env_map
+  )
+
+  topo = topology or discover_cpu_topology()
+  plan = partition_server_cpus(
+    world_size=world_size,
+    rank=rank,
+    local_rank=local_rank,
+    local_world_size=local_world_size,
+    device=None,
+    preferred_numa_node=numa,
+    driver_physical_cores=driver_physical_cores,
+    topology=topo,
+  )
+  n_drv = max(1, min(4, len(plan.driver_primary_cpu_ids) or plan.torch_num_threads))
+  env_map.setdefault("OMP_NUM_THREADS", str(n_drv))
+  env_map.setdefault("MKL_NUM_THREADS", str(n_drv))
+
+  applied_affinity = False
+  if set_affinity and plan.driver_primary_cpu_ids and hasattr(os, "sched_setaffinity"):
+    _snapshot_initial_allowed_cpus()
+    try:
+      os.sched_setaffinity(0, set(plan.driver_primary_cpu_ids))
+      applied_affinity = True
+    except OSError:
+      applied_affinity = False
+
+  return {
+    "is_multi_gpu_launcher": False,
+    "applied_affinity": applied_affinity,
+    "driver_primary_cpu_ids": list(plan.driver_primary_cpu_ids),
+    "main_thread_cpu_id": plan.main_thread_cpu_id,
+    "omp_num_threads": env_map.get("OMP_NUM_THREADS"),
+    "omp_proc_bind": env_map.get("OMP_PROC_BIND"),
+    "omp_places": env_map.get("OMP_PLACES"),
+    "gomp_spincount": env_map.get("GOMP_SPINCOUNT"),
+    "preferred_numa_node": plan.preferred_numa_node,
+  }
 
 
 def register_worker_thread(tid: int | None = None) -> int:
@@ -558,13 +799,20 @@ def confine_process_threads(
   cpu_ids: Sequence[int],
   *,
   skip_tids: Iterable[int] = (),
+  preserve_subset_affinities: bool = True,
 ) -> int:
-  """Pin current process and all non-worker threads in ``/proc/self/task`` to ``cpu_ids``."""
+  """Pin current process and all non-worker threads in ``/proc/self/task`` to ``cpu_ids``.
+
+  When ``preserve_subset_affinities=True`` (default), threads whose existing affinity is
+  already a non-empty strict subset of ``cpu_ids`` (for example, ``libgomp``'s 1-to-1
+  ``OMP_PROC_BIND=close`` per-core bindings) are left untouched instead of being widened.
+  """
   if not cpu_ids or not hasattr(os, "sched_setaffinity"):
     return 0
   mask = set(int(c) for c in cpu_ids)
   skipped = set(int(t) for t in skip_tids)
   pinned = 0
+  has_get = hasattr(os, "sched_getaffinity")
   if _PROC_TASK_ROOT.is_dir():
     for entry in _PROC_TASK_ROOT.iterdir():
       if not entry.name.isdigit():
@@ -573,14 +821,24 @@ def confine_process_threads(
       if tid in skipped:
         continue
       try:
+        if preserve_subset_affinities and has_get:
+          cur = os.sched_getaffinity(tid)
+          if cur and cur.issubset(mask) and len(cur) < len(mask):
+            continue
         os.sched_setaffinity(tid, mask)
         pinned += 1
       except OSError:
         continue
   else:
     try:
-      os.sched_setaffinity(0, mask)
-      pinned = 1
+      skip_cur = False
+      if preserve_subset_affinities and has_get:
+        cur = os.sched_getaffinity(0)
+        if cur and cur.issubset(mask) and len(cur) < len(mask):
+          skip_cur = True
+      if not skip_cur:
+        os.sched_setaffinity(0, mask)
+        pinned = 1
     except OSError:
       pass
   return pinned
@@ -590,22 +848,71 @@ def apply_cpu_execution_plan(
   plan: CpuExecutionPlan,
   *,
   configure_torch_threads: bool = True,
+  primary_driver_only: bool = False,
+  lock_dma_latency: bool = True,
+  warn_powersave: bool = True,
 ) -> dict[str, object]:
   """Apply ``plan`` to the current training rank without touching RNG or GPU state."""
-  global _ACTIVE_PLAN
+  global _ACTIVE_PLAN, _WARNED_POWERSAVE
   with _LOCK:
     _ACTIVE_PLAN = plan
     worker_tids = set(_REGISTERED_WORKER_TIDS)
 
-  pinned_threads = confine_process_threads(plan.driver_cpu_ids, skip_tids=worker_tids)
+  target_cpus = (
+    plan.driver_primary_cpu_ids
+    if (primary_driver_only and plan.driver_primary_cpu_ids)
+    else plan.driver_cpu_ids
+  )
+  _snapshot_initial_allowed_cpus()
+  pinned_threads = confine_process_threads(
+    target_cpus,
+    skip_tids=worker_tids,
+    preserve_subset_affinities=True,
+  )
+  interop_threads: int | None = None
   if configure_torch_threads:
     import torch
 
     if torch.get_num_threads() != plan.torch_num_threads:
       torch.set_num_threads(plan.torch_num_threads)
+    try:
+      if torch.get_num_interop_threads() != 1:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+      pass
+    try:
+      interop_threads = int(torch.get_num_interop_threads())
+    except Exception:
+      interop_threads = None
+
+  dma_locked = try_lock_cpu_dma_latency(0) if lock_dma_latency else False
+  cpufreq = probe_cpufreq_telemetry(plan.main_thread_cpu_id)
+  if (
+    warn_powersave
+    and not _WARNED_POWERSAVE
+    and cpufreq.get("scaling_governor") == "powersave"
+  ):
+    _WARNED_POWERSAVE = True
+    warnings.warn(
+      f"[MLAB4_Fast CPU] CPU {plan.main_thread_cpu_id} is using scaling_governor='powersave' "
+      f"(driver={cpufreq.get('scaling_driver')}, EPP={cpufreq.get('energy_performance_preference')}, "
+      f"cur={cpufreq.get('scaling_cur_freq_khz')} kHz / max={cpufreq.get('cpuinfo_max_freq_khz')} kHz). "
+      "Non-root mitigations active (primary-core pinning + OMP_PROC_BIND=close + GOMP_SPINCOUNT=200000); "
+      "for maximum turbo stability run: sudo cpupower frequency-set -g performance",
+      RuntimeWarning,
+      stacklevel=2,
+    )
 
   info = plan.to_dict()
   info["pinned_existing_threads"] = pinned_threads
+  info["primary_driver_only"] = bool(primary_driver_only)
+  info["torch_num_interop_threads"] = interop_threads
+  info["omp_proc_bind"] = os.environ.get("OMP_PROC_BIND")
+  info["omp_places"] = os.environ.get("OMP_PLACES")
+  info["omp_num_threads"] = os.environ.get("OMP_NUM_THREADS")
+  info["gomp_spincount"] = os.environ.get("GOMP_SPINCOUNT")
+  info["dma_latency_locked"] = dma_locked
+  info["cpufreq"] = cpufreq
   return info
 
 
@@ -691,6 +998,15 @@ def get_worker_io_cpu_ids() -> tuple[int, ...]:
   if e_groups:
     return tuple(sorted(cid for g in e_groups for cid in g.cpu_ids))
   return get_worker_cpu_ids()
+
+
+def get_worker_reset_pool_cpu_ids() -> tuple[int, ...]:
+  """Return 1..2 same-NUMA primary P-cores reserved for the async CPU reset-state producer."""
+  plan = get_active_cpu_plan()
+  if plan is not None and plan.worker_reset_pool_cpu_ids:
+    return plan.worker_reset_pool_cpu_ids
+  compute = get_worker_compute_cpu_ids()
+  return compute[:2] if compute else get_worker_cpu_ids()[:2]
 
 
 def get_optimal_batch_sim_threads(

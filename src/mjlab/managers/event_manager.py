@@ -243,6 +243,108 @@ class EventManager(ManagerBase):
             )
     return {}
 
+  def reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe reset of interval timers and class terms."""
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    for mode_cfg in self._mode_class_term_cfgs.values():
+      for term_cfg in mode_cfg:
+        if hasattr(term_cfg.func, "reset_masked"):
+          term_cfg.func.reset_masked(mask)
+        else:
+          term_cfg.func.reset(env_ids=mask)
+    if "interval" in self._mode_term_cfgs:
+      for index, term_cfg in enumerate(self._mode_term_cfgs["interval"]):
+        if not term_cfg.is_global_time:
+          assert term_cfg.interval_range_s is not None
+          lower, upper = term_cfg.interval_range_s
+          sampled = (
+            torch.rand(self._env.num_envs, device=self.device) * (upper - lower) + lower
+          )
+          tl = self._interval_term_time_left[index]
+          torch.where(mask, sampled, tl, out=tl)
+          self._interval_time_left_lower_bound[index] = min(
+            self._interval_time_left_lower_bound[index], float(lower)
+          )
+
+  def apply_interval_masked(self, dt: float) -> None:
+    """Branchless CUDA-Graph-safe execution of ``mode='interval'`` events (zero nonzero/item)."""
+    if "interval" not in self._mode_term_cfgs:
+      return
+    for index, term_cfg in enumerate(self._mode_term_cfgs["interval"]):
+      assert not term_cfg.is_global_time, (
+        "Global-time interval events are not masked-graph eligible"
+      )
+      tl = self._interval_term_time_left[index]
+      tl.sub_(float(dt))
+      fire_mask = tl < 1e-6
+      assert term_cfg.interval_range_s is not None
+      lower, upper = term_cfg.interval_range_s
+      sampled = (
+        torch.rand(self._env.num_envs, device=self.device) * (upper - lower) + lower
+      )
+      torch.where(fire_mask, sampled, tl, out=tl)
+      handler = getattr(term_cfg.func, "_masked_handler", None)
+      if handler is None:
+        raise RuntimeError(
+          f"Interval event term '{term_cfg.func}' lacks a registered _masked_handler."
+        )
+      handler(self._env, fire_mask, **term_cfg.params)
+
+  def apply_step_masked(self, dt: float) -> None:
+    """Branchless CUDA-Graph-safe execution of ``mode='step'`` events."""
+    if "step" not in self._mode_term_cfgs:
+      return
+    for term_cfg in self._mode_term_cfgs["step"]:
+      handler = getattr(term_cfg.func, "_masked_handler", None)
+      if handler is not None:
+        handler(self._env, dt, **term_cfg.params)
+      else:
+        term_cfg.func(self._env, None, **term_cfg.params)
+
+  def apply_reset_masked(self, reset_mask: torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe execution of ``mode='reset'`` events."""
+    if "reset" not in self._mode_term_cfgs:
+      return
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    for index, term_cfg in enumerate(self._mode_term_cfgs["reset"]):
+      assert term_cfg.min_step_count_between_reset == 0
+      self._reset_term_last_triggered_once[index].logical_or_(mask)
+      handler = getattr(term_cfg.func, "_masked_handler", None)
+      if handler is None:
+        raise RuntimeError(
+          f"Reset event term '{term_cfg.func}' lacks a registered _masked_handler."
+        )
+      handler(self._env, mask, **term_cfg.params)
+
+  def is_masked_graph_compatible(self) -> tuple[bool, str]:
+    """Check whether all active reset/interval/step events support branchless CUDA Graph capture."""
+    from mjlab.sim.sim import RecomputeLevel
+
+    for mode in ("reset", "interval", "step"):
+      for term_cfg in self._mode_term_cfgs.get(mode, ()):
+        level = getattr(term_cfg.func, "recompute", RecomputeLevel.none)
+        if level != RecomputeLevel.none:
+          return False, f"event '{term_cfg.func}' requires sim recompute={level}"
+        if mode == "reset":
+          if term_cfg.min_step_count_between_reset != 0:
+            return (
+              False,
+              f"reset event '{term_cfg.func}' has min_step_count_between_reset != 0",
+            )
+          if getattr(term_cfg.func, "_masked_handler", None) is None:
+            return False, f"reset event '{term_cfg.func}' has no _masked_handler"
+        elif mode == "interval":
+          if term_cfg.is_global_time:
+            return False, f"interval event '{term_cfg.func}' uses is_global_time=True"
+          if getattr(term_cfg.func, "_masked_handler", None) is None:
+            return False, f"interval event '{term_cfg.func}' has no _masked_handler"
+        elif mode == "step":
+          if getattr(term_cfg.func, "_masked_handler", None) is None and not getattr(
+            term_cfg.func, "_cuda_graph_safe", False
+          ):
+            return False, f"step event '{term_cfg.func}' is not marked CUDA-graph safe"
+    return True, "ok"
+
   def apply(
     self,
     mode: EventMode,

@@ -88,6 +88,66 @@ def terrain_levels_vel(
   return result
 
 
+def terrain_levels_vel_masked(
+  env: ManagerBasedRlEnv,
+  mask: torch.Tensor,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_SCENE_CFG,
+) -> None:
+  """Branchless CUDA-Graph-safe version of ``terrain_levels_vel``."""
+  if env.common_step_counter == 0:
+    return
+  asset: Entity = env.scene[asset_cfg.name]
+  terrain = env.scene.terrain
+  assert terrain is not None
+  terrain_generator = terrain.cfg.terrain_generator
+  assert terrain_generator is not None
+  command = env.command_manager.get_command(command_name)
+  assert command is not None
+
+  distance = torch.norm(
+    asset.data.root_link_pos_w[:, :2] - env.scene.env_origins[:, :2],
+    dim=1,
+  )
+  move_up = distance > (terrain_generator.size[0] / 2)
+  move_down = (
+    distance < torch.norm(command[:, :2], dim=1) * env.max_episode_length_s * 0.5
+  ) & (~move_up)
+  terrain.update_env_origins_masked(mask, move_up, move_down)
+
+
+def _log_terrain_levels_vel(
+  env: ManagerBasedRlEnv,
+  command_name: str,
+  asset_cfg: SceneEntityCfg = _DEFAULT_SCENE_CFG,
+) -> dict[str, torch.Tensor]:
+  """Iteration-end telemetry readout for ``terrain_levels_vel``."""
+  del command_name, asset_cfg
+  terrain = env.scene.terrain
+  assert terrain is not None
+  terrain_generator = terrain.cfg.terrain_generator
+  assert terrain_generator is not None
+  levels = terrain.terrain_levels.float()
+  result: dict[str, torch.Tensor] = {
+    "mean": torch.mean(levels),
+    "max": torch.max(levels),
+  }
+  sub_terrain_names = list(terrain_generator.sub_terrains.keys())
+  terrain_origins = terrain.terrain_origins
+  assert terrain_origins is not None
+  if terrain_origins.shape[1] == len(sub_terrain_names):
+    types = terrain.terrain_types
+    for i, name in enumerate(sub_terrain_names):
+      m = types == i
+      if m.any():
+        result[name] = torch.mean(levels[m])
+  return result
+
+
+terrain_levels_vel.compute_masked = terrain_levels_vel_masked  # type: ignore[attr-defined]
+terrain_levels_vel._iter_level_log = _log_terrain_levels_vel  # type: ignore[attr-defined]
+
+
 def commands_vel(
   env: ManagerBasedRlEnv,
   env_ids: torch.Tensor,
@@ -114,3 +174,6 @@ def commands_vel(
     "ang_vel_z_min": torch.tensor(cfg.ranges.ang_vel_z[0]),
     "ang_vel_z_max": torch.tensor(cfg.ranges.ang_vel_z[1]),
   }
+
+
+commands_vel._iter_level_curriculum = True  # type: ignore[attr-defined]

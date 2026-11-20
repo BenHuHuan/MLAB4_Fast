@@ -156,6 +156,41 @@ class MetricsManager(ManagerBase):
 
     return extras
 
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], torch.Tensor | None]:
+    """Branchless CUDA-Graph-safe metric aggregation and reset over ``reset_mask``."""
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    mask_f = mask.to(dtype=torch.float32)
+    keys = list(self._episode_sums.keys())
+    sums: torch.Tensor | None = None
+    if keys:
+      safe_counts = self._step_count.float().clamp_min(1.0)
+      per_term: list[torch.Tensor] = []
+      for idx, key in enumerate(keys):
+        reduce = self._term_cfgs[idx].reduce
+        if reduce == "max":
+          v = torch.where(mask, self._episode_max[key], torch.zeros_like(mask_f))
+          per_term.append(v.sum())
+          self._episode_max[key].masked_fill_(mask, float("-inf"))
+        elif reduce == "last":
+          per_term.append((self._step_values[:, idx] * mask_f).sum())
+        elif reduce == "sum":
+          per_term.append((self._episode_sums[key] * mask_f).sum())
+        else:
+          per_term.append(((self._episode_sums[key] / safe_counts) * mask_f).sum())
+        self._episode_sums[key].masked_fill_(mask, 0.0)
+      sums = torch.stack(per_term, dim=0)
+    self._step_count.masked_fill_(mask, 0)
+    for buf in self._substep_accum:
+      buf.masked_fill_(mask, 0.0)
+    for term_cfg in self._class_term_cfgs:
+      if hasattr(term_cfg.func, "reset_masked"):
+        term_cfg.func.reset_masked(mask)
+      else:
+        term_cfg.func.reset(env_ids=mask)
+    return keys, sums
+
   def compute_substep(self) -> None:
     """Accumulate per-substep metric values inside the decimation loop.
 

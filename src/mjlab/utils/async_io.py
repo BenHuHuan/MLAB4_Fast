@@ -596,6 +596,22 @@ class AsyncCheckpointWorker:
     self.total_saves_submitted = 0
     self.last_main_thread_save_ms = 0.0
     self.save_latencies_ms: list[float] = []
+    # Register LIFO weakref atexit shutdown so uncaught exceptions never deadlock
+    # Python's multiprocessing._exit_function waiting on the non-daemon worker!
+    import atexit as _atexit
+    import weakref as _weakref
+
+    _self_ref = _weakref.ref(self)
+
+    def _atexit_close() -> None:
+      obj = _self_ref()
+      if obj is not None and not obj._closed:
+        try:
+          obj.close()
+        except Exception:
+          pass
+
+    _atexit.register(_atexit_close)
 
   def attach_sidecar_queue(self, notify_queue: Any | None) -> None:
     """Attach a sidecar queue if worker was pre-warmed prior to sidecar instantiation."""

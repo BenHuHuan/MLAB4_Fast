@@ -111,6 +111,49 @@ class CommandTerm(ManagerTermBase):
     self._resample(env_ids)
     return extras
 
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], torch.Tensor | None]:
+    """Branchless CUDA-Graph-safe reset returning masked metric sums over ``reset_mask``."""
+    mask = reset_mask.to(device=self.device, dtype=torch.bool)
+    mask_f = mask.to(dtype=torch.float32)
+    keys = list(self.metrics.keys())
+    sums: torch.Tensor | None = None
+    if keys:
+      vals = [self.metrics[k] for k in keys]
+      sums = (torch.stack(vals, dim=0) * mask_f.unsqueeze(0)).sum(dim=1)
+      for v in vals:
+        v.masked_fill_(mask, 0.0)
+    self.command_counter.masked_fill_(mask, 0)
+    self._resample_masked(mask)
+    return keys, sums
+
+  def _resample_masked(self, mask: torch.Tensor) -> None:
+    """Branchless timer refill + masked command resampling."""
+    m1 = mask.to(device=self.device, dtype=torch.bool)
+    lo, hi = self.cfg.resampling_time_range
+    sampled = torch.empty_like(self.time_left).uniform_(lo, hi)
+    torch.where(m1, sampled, self.time_left, out=self.time_left)
+    self._time_left_lower_bound = min(self._time_left_lower_bound, float(lo))
+    self._resample_command_masked(m1)
+    self.command_counter.add_(m1.to(dtype=self.command_counter.dtype))
+
+  def _resample_command_masked(self, mask: torch.Tensor) -> None:
+    raise NotImplementedError(
+      f"{type(self).__name__} does not implement _resample_command_masked()."
+    )
+
+  def compute_masked(self, dt: float | torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe command advance (zero nonzero()/item())."""
+    self._update_metrics()
+    self.time_left.sub_(dt)
+    resample_mask = self.time_left <= 0.0
+    self._resample_masked(resample_mask)
+    self._update_command_masked()
+
+  def _update_command_masked(self) -> None:
+    self._update_command(None)
+
   def compute(
     self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None
   ) -> None:
@@ -307,9 +350,36 @@ class CommandManager(ManagerBase):
         extras[f"Metrics/{name}/{metric_name}"] = metric_value
     return extras
 
+  def reset_masked(
+    self, reset_mask: torch.Tensor
+  ) -> tuple[list[str], list[torch.Tensor]]:
+    """Branchless CUDA-Graph-safe reset across all command terms."""
+    out_keys: list[str] = []
+    out_sums: list[torch.Tensor] = []
+    for name, term in self._terms.items():
+      keys, sums = term.reset_masked(reset_mask)
+      if keys and sums is not None:
+        out_keys.extend(f"Metrics/{name}/{k}" for k in keys)
+        out_sums.append(sums)
+    return out_keys, out_sums
+
   def compute(self, dt: float | torch.Tensor, env_ids: torch.Tensor | None = None):
     for term in self._terms.values():
       term.compute(dt, env_ids)
+
+  def compute_masked(self, dt: float | torch.Tensor) -> None:
+    """Branchless CUDA-Graph-safe compute across all command terms."""
+    for term in self._terms.values():
+      term.compute_masked(dt)
+
+  def is_masked_graph_compatible(self) -> tuple[bool, str]:
+    for name, term in self._terms.items():
+      if type(term)._resample_command_masked is CommandTerm._resample_command_masked:
+        return (
+          False,
+          f"command term '{name}' ({type(term).__name__}) lacks _resample_command_masked",
+        )
+    return True, "ok"
 
   def get_command(self, name: str) -> torch.Tensor:
     return self._terms[name].command

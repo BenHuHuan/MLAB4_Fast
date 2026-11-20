@@ -2,7 +2,7 @@ import functools
 import gc
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import mujoco
 import numpy as np
@@ -254,11 +254,25 @@ class ManagerBasedRlEnv:
     self.load_managers()
     self.setup_manager_visualizers()
 
-    # Opt-in FP32 exact runtime optimization state (off by default).
+    # Opt-in FP32 exact runtime optimization state (auto-activated when configured on cfg).
     self._zero_sync_metrics: bool = False
     self._use_kinematic_post_step_forward: bool = False
     self._decimation_substep_runner: _DecimationSubstepGraph | None = None
     self._fp32_step_opts_active: bool = False
+    self._mega_step_graph: Any = None
+    self._staged_episode_logs_active: bool = False
+    self._fp32_step_opt_report: dict[str, Any] = {}
+    if (
+      type(self).step is ManagerBasedRlEnv.step
+      and getattr(cfg, "_rollout_optimization_mode", "off") != "off"
+    ):
+      self._fp32_step_opt_report = self.enable_fp32_step_optimizations(
+        zero_sync_metrics=bool(getattr(cfg, "_use_zero_sync_optimizations", True)),
+        kinematic_forward=True,
+        substep_graph=bool(getattr(cfg, "_use_substep_cuda_graph", True)),
+        mega_graph_mode=str(getattr(cfg, "_mega_graph_mode", "env")),
+        reset_pool_mode=str(getattr(cfg, "_reset_pool_mode", "auto")),
+      )
 
   # Properties.
 
@@ -432,6 +446,8 @@ class ManagerBasedRlEnv:
       etc.) in the same function that writes state (``write_root_state_to_sim``,
       ``write_joint_state_to_sim``, etc.). See :ref:`faq` for details.
     """
+    if self._mega_step_graph is not None:
+      return self._mega_step_graph.step(action)
     if self._fp32_step_opts_active:
       return self._step_fp32_optimized(action)
     if not self.cfg.auto_reset and torch.any(self._manual_reset_pending):
@@ -536,9 +552,27 @@ class ManagerBasedRlEnv:
       )
 
   def close(self) -> None:
+    if getattr(self, "_mega_step_graph", None) is not None:
+      self._mega_step_graph.close()
+      self._mega_step_graph = None
     if self._offline_renderer is not None:
       self._offline_renderer.close()
     self.recorder_manager.close()
+
+  def begin_rollout_iteration(self, num_steps: int) -> None:
+    """Order GPU stream after async reset-pool DMA and enable zero-dilution metric staging."""
+    mg = getattr(self, "_mega_step_graph", None)
+    if mg is not None:
+      mg.begin_iteration(num_steps)
+      self._staged_episode_logs_active = True
+
+  def end_rollout_iteration(self) -> list[dict[str, float]]:
+    """Flush staged per-step metrics (skipping 0-reset steps) and kick async reset-pool refill."""
+    mg = getattr(self, "_mega_step_graph", None)
+    self._staged_episode_logs_active = False
+    if mg is not None:
+      return mg.end_iteration()
+    return []
 
   @staticmethod
   def seed(seed: int = -1) -> int:
@@ -822,8 +856,10 @@ class ManagerBasedRlEnv:
     zero_sync_metrics: bool = True,
     kinematic_forward: bool = True,
     substep_graph: bool = True,
-  ) -> dict[str, bool]:
-    """Enable exact FP32 step optimizations when statically proven safe."""
+    mega_graph_mode: str | None = None,
+    reset_pool_mode: str | None = None,
+  ) -> dict[str, Any]:
+    """Enable exact FP32 step optimizations (including Tier 1 EnvFullStepGraph) when safe."""
     self._zero_sync_metrics = bool(zero_sync_metrics)
     if kinematic_forward and self._can_use_kinematic_post_step_forward():
       self._use_kinematic_post_step_forward = True
@@ -836,6 +872,65 @@ class ManagerBasedRlEnv:
     else:
       self._decimation_substep_runner = None
 
+    eff_mega = (
+      str(getattr(self.cfg, "_mega_graph_mode", "env"))
+      if mega_graph_mode is None
+      else str(mega_graph_mode)
+    )
+    eff_pool = (
+      str(getattr(self.cfg, "_reset_pool_mode", "auto"))
+      if reset_pool_mode is None
+      else str(reset_pool_mode)
+    )
+    if getattr(self.cfg, "_strict_rng_parity", False):
+      eff_mega = "off"
+      eff_pool = "off"
+
+    mega_reason = "disabled"
+    if eff_mega in ("env", "rollout"):
+      from mjlab.envs.mega_step_graph import EnvFullStepGraph
+      from mjlab.envs.reset_pool import build_mjlab_motion_reset_pool
+
+      ok, mega_reason = EnvFullStepGraph.is_supported(self)
+      if ok:
+        if self._mega_step_graph is None:
+          pools = []
+          if eff_pool in ("auto", "async_ring"):
+            for cmd_term in self.command_manager._terms.values():
+              if (
+                type(cmd_term).__name__ == "MotionCommand"
+                and getattr(cmd_term, "_async_reset_pool", None) is None
+              ):
+                # Under "auto", keep adaptive sampling on live GPU branchless multinomial
+                # inside EnvFullStepGraph to avoid FIFO ring staleness (verified on real
+                # 131.5s LAFAN1 dance motion: +36.9% FPS with exact baseline tracking error).
+                if (
+                  eff_pool == "auto"
+                  and getattr(cmd_term.cfg, "sampling_mode", "adaptive") == "adaptive"
+                ):
+                  continue
+                pool = build_mjlab_motion_reset_pool(
+                  cmd_term,
+                  seed=int(getattr(self.cfg, "seed", 0) or 0),
+                )
+                cmd_term._async_reset_pool = pool  # type: ignore[attr-defined]
+                pools.append(
+                  (
+                    pool,
+                    lambda _c=cmd_term: (
+                      cast(Any, _c).bin_failed_count.detach().cpu().numpy()
+                    ),
+                  )
+                )
+          self._mega_step_graph = EnvFullStepGraph(self, reset_pools=pools)
+      else:
+        if self._mega_step_graph is not None:
+          self._mega_step_graph.close()
+          self._mega_step_graph = None
+    elif self._mega_step_graph is not None:
+      self._mega_step_graph.close()
+      self._mega_step_graph = None
+
     self._fp32_step_opts_active = type(self).step is ManagerBasedRlEnv.step and (
       self._zero_sync_metrics
       or self._use_kinematic_post_step_forward
@@ -846,6 +941,8 @@ class ManagerBasedRlEnv:
       "zero_sync_metrics": self._zero_sync_metrics,
       "kinematic_post_step_forward": self._use_kinematic_post_step_forward,
       "decimation_substep_graph": self._decimation_substep_runner is not None,
+      "mega_step_graph": self._mega_step_graph is not None,
+      "mega_step_graph_reason": mega_reason,
     }
 
 
@@ -860,7 +957,9 @@ class _DecimationSubstepGraph:
     self.captures: int = 0
     self.replays: int = 0
     self.stream = torch.cuda.Stream(device=env.device)
-    self.warp_stream = wp.stream_from_torch(self.stream)
+    self.warp_stream = wp.Stream(
+      device=env.sim.wp_device, cuda_stream=self.stream.cuda_stream
+    )
 
   @staticmethod
   def is_supported(env: ManagerBasedRlEnv) -> bool:
@@ -951,7 +1050,13 @@ class _DecimationSubstepGraph:
       self.warm_steps = 0
       self.signature = signature
     if self.warm_steps < 2:
-      self._body()
+      prev_inline = getattr(env.sim, "_inline_warp_kernels", False)
+      try:
+        env.sim._inline_warp_kernels = True
+        with torch.inference_mode(False), torch.no_grad():
+          self._body()
+      finally:
+        env.sim._inline_warp_kernels = prev_inline
       self.warm_steps += 1
     else:
       current = torch.cuda.current_stream(env.device)
@@ -959,16 +1064,31 @@ class _DecimationSubstepGraph:
       ctrl = env.sim.data.ctrl
       ctrl_stream = ctrl._torch_stream
       use_cuda_graph = env.sim.use_cuda_graph
+      prev_inline = getattr(env.sim, "_inline_warp_kernels", False)
       was_enabled = gc.isenabled()
       try:
-        with torch.cuda.stream(self.stream), wp.ScopedStream(self.warp_stream):
+        with (
+          torch.inference_mode(False),
+          torch.no_grad(),
+          torch.cuda.stream(self.stream),
+          wp.ScopedStream(self.warp_stream, sync_enter=False, sync_exit=False),
+        ):
           if self.graph is None:
             ctrl._torch_stream = self.stream
             env.sim.use_cuda_graph = False
+            env.sim._inline_warp_kernels = True
             gc.disable()
             self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, stream=self.stream):
-              with wp.ScopedCapture(stream=self.warp_stream, external=True):
+            with torch.cuda.graph(
+              self.graph,
+              stream=self.stream,
+              capture_error_mode="thread_local",
+            ):
+              with wp.ScopedCapture(
+                stream=self.warp_stream,
+                external=True,
+                capture_mode=wp.CaptureMode.THREAD_LOCAL,
+              ):
                 self._body()
             self.captures += 1
           self.graph.replay()
@@ -976,6 +1096,7 @@ class _DecimationSubstepGraph:
       finally:
         ctrl._torch_stream = ctrl_stream
         env.sim.use_cuda_graph = use_cuda_graph
+        env.sim._inline_warp_kernels = prev_inline
         if was_enabled:
           gc.enable()
         current.wait_stream(self.stream)

@@ -15,12 +15,20 @@ if TYPE_CHECKING:
 
 def _get_body_indexes(
   command: MotionCommand, body_names: tuple[str, ...] | None
-) -> list[int]:
-  return [
-    i
-    for i, name in enumerate(command.cfg.body_names)
-    if (body_names is None) or (name in body_names)
-  ]
+) -> torch.Tensor | slice:
+  if body_names is None:
+    return slice(None)
+  cache = getattr(command, "_body_indexes_tensor_cache", None)
+  if cache is None:
+    cache = {}
+    command._body_indexes_tensor_cache = cache  # type: ignore[attr-defined]
+  key = tuple(body_names)
+  idx = cache.get(key)
+  if idx is None:
+    raw = [i for i, name in enumerate(command.cfg.body_names) if name in key]
+    idx = torch.tensor(raw, dtype=torch.long, device=command.device)
+    cache[key] = idx
+  return idx
 
 
 def motion_global_anchor_position_error_exp(

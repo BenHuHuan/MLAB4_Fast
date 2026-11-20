@@ -88,6 +88,8 @@ exclude_patterns = [
   "README.md",
   "TIANGONG3_CAPSULE_COLLISION_REPORT.md",
   "CPU_MEGA_GRAPH_REPORT.md",
+  "LARGE_SCALE_VALIDATION_REPORT.md",
+  "cpu_mega_graph_report.html",
   "licenses/*",
 ]
 

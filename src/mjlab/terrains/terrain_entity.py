@@ -233,6 +233,31 @@ class TerrainEntity(Entity):
       self.terrain_levels[env_ids], self.terrain_types[env_ids]
     ]
 
+  def update_env_origins_masked(
+    self,
+    mask: torch.Tensor,
+    move_up: torch.Tensor,
+    move_down: torch.Tensor,
+  ) -> None:
+    """Branchless CUDA-Graph-safe terrain level update over boolean ``mask``."""
+    if self.terrain_origins is None:
+      return
+    assert self.env_origins is not None
+    m = mask.to(device=self._device, dtype=torch.bool)
+    delta = move_up.to(dtype=self.terrain_levels.dtype) - move_down.to(
+      dtype=self.terrain_levels.dtype
+    )
+    cand = self.terrain_levels + torch.where(m, delta, torch.zeros_like(delta))
+    rand_lvl = torch.randint_like(self.terrain_levels, self.max_terrain_level)
+    wrapped = torch.where(
+      cand >= self.max_terrain_level,
+      rand_lvl,
+      torch.clamp(cand, min=0),
+    )
+    torch.where(m, wrapped, self.terrain_levels, out=self.terrain_levels)
+    new_origins = self.terrain_origins[self.terrain_levels, self.terrain_types]
+    torch.where(m.unsqueeze(-1), new_origins, self.env_origins, out=self.env_origins)
+
   def randomize_env_origins(self, env_ids: torch.Tensor) -> None:
     """Randomize the environment origins to random sub-terrains."""
     if self.terrain_origins is None:
