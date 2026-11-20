@@ -131,7 +131,7 @@ class TrainConfig:
   """Disable async reset pool, mega CUDA graph, and ZeroSyncPPO for legacy bitwise PRNG regression tests."""
   mega_graph_mode: Literal["auto", "off", "env", "rollout"] = "auto"
   """Full-step CUDA graph tier: 'auto' (env for fp32_exact, rollout for fp32_fast), 'off', 'env', or 'rollout'."""
-  reset_pool_mode: Literal["off", "async_ring"] = "async_ring"
+  reset_pool_mode: Literal["auto", "off", "async_ring"] = "auto"
   """Background CPU reset-state ring pool mode under fp32_exact / fp32_fast."""
   cpu_optimizations: bool = True
   """NUMA/P-core CPU isolation + save_v2 async checkpointing + batched logging."""

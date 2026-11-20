@@ -895,12 +895,20 @@ class ManagerBasedRlEnv:
       if ok:
         if self._mega_step_graph is None:
           pools = []
-          if eff_pool == "async_ring":
+          if eff_pool in ("auto", "async_ring"):
             for cmd_term in self.command_manager._terms.values():
               if (
                 type(cmd_term).__name__ == "MotionCommand"
                 and getattr(cmd_term, "_async_reset_pool", None) is None
               ):
+                # Under "auto", keep adaptive sampling on live GPU branchless multinomial
+                # inside EnvFullStepGraph to avoid FIFO ring staleness (verified on real
+                # 131.5s LAFAN1 dance motion: +36.9% FPS with exact baseline tracking error).
+                if (
+                  eff_pool == "auto"
+                  and getattr(cmd_term.cfg, "sampling_mode", "adaptive") == "adaptive"
+                ):
+                  continue
                 pool = build_mjlab_motion_reset_pool(
                   cmd_term,
                   seed=int(getattr(self.cfg, "seed", 0) or 0),

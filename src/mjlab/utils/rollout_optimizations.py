@@ -86,7 +86,7 @@ def configure_fp32_exact(
   enabled: bool = True,
   strict_rng_parity: bool = False,
   mega_graph_mode: str = "env",
-  reset_pool_mode: str = "async_ring",
+  reset_pool_mode: str = "auto",
 ) -> dict[str, Any]:
   """Configure FP32-exact lossless acceleration (#2A + #2B + #1A Tier 1 env graph)."""
   return _apply_mode_flags(
@@ -106,7 +106,7 @@ def configure_fp32_fast(
   enabled: bool = True,
   strict_rng_parity: bool = False,
   mega_graph_mode: str = "rollout",
-  reset_pool_mode: str = "async_ring",
+  reset_pool_mode: str = "auto",
 ) -> dict[str, Any]:
   """Configure pure-FP32 max-throughput acceleration (#2A + #2B + #1A + #1B Tier 2 rollout mega-graph)."""
   return _apply_mode_flags(
@@ -126,7 +126,7 @@ def resolve_fp32_execution_mode(
   fp32_fast: bool = False,
   strict_rng_parity: bool = False,
   mega_graph_mode: str = "auto",
-  reset_pool_mode: str = "async_ring",
+  reset_pool_mode: str = "auto",
 ) -> dict[str, Any]:
   """Resolve effective IEEE FP32 execution settings from high-level CLI flags."""
   ieee_enabled = bool(fp32_exact or fp32_fast)

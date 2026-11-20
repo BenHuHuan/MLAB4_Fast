@@ -298,7 +298,7 @@ def test_fp32_exact_and_fp32_fast_mode_resolution_and_ieee_enforcement():
   assert r_exact["zero_sync_ppo"] is True
   assert r_exact["zero_sync_rollout"] is True
   assert r_exact["mega_graph_mode"] == "env"
-  assert r_exact["reset_pool_mode"] == "async_ring"
+  assert r_exact["reset_pool_mode"] == "auto"
 
   # fp32_fast: still strict IEEE 32-bit FP32 (allow_tf32=False), upgrades to Tier 2 rollout graph!
   r_fast = resolve_fp32_execution_mode(fp32_exact=True, fp32_fast=True)
@@ -309,7 +309,7 @@ def test_fp32_exact_and_fp32_fast_mode_resolution_and_ieee_enforcement():
   assert r_fast["zero_sync_ppo"] is True
   assert r_fast["zero_sync_rollout"] is True
   assert r_fast["mega_graph_mode"] == "rollout"
-  assert r_fast["reset_pool_mode"] == "async_ring"
+  assert r_fast["reset_pool_mode"] == "auto"
 
   # strict_rng_parity overrides BOTH fp32_exact and fp32_fast while preserving IEEE FP32.
   r_parity = resolve_fp32_execution_mode(
@@ -357,7 +357,9 @@ def test_real_velocity_rough_env_tier1_and_tier2_zero_sync(tmp_path):
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
-  from mjlab.utils.rollout_optimizations import configure_fp32_fast
+  from mjlab.utils.rollout_optimizations import (
+    configure_fp32_fast,
+  )
   from mjlab.utils.torch import configure_torch_backends
 
   configure_torch_backends(allow_tf32=False)
@@ -411,7 +413,10 @@ def test_real_tracking_env_async_reset_pool_and_mega_graph(tmp_path):
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
-  from mjlab.utils.rollout_optimizations import configure_fp32_fast
+  from mjlab.utils.rollout_optimizations import (
+    configure_fp32_exact,
+    configure_fp32_fast,
+  )
   from mjlab.utils.torch import configure_torch_backends
 
   configure_torch_backends(allow_tf32=False)
@@ -442,7 +447,7 @@ def test_real_tracking_env_async_reset_pool_and_mega_graph(tmp_path):
     body_ang_vel_w=body_ang_vel_w,
   )
   env_cfg.commands["motion"].motion_file = str(motion_path)  # type: ignore[attr-defined]
-  configure_fp32_fast(env_cfg, enabled=True)
+  configure_fp32_fast(env_cfg, enabled=True, reset_pool_mode="async_ring")
 
   env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
   try:
@@ -473,8 +478,23 @@ def test_real_tracking_env_async_reset_pool_and_mega_graph(tmp_path):
     assert runner._rollout_mega_graph.captures == 1
     assert runner._rollout_mega_graph.replays >= 22
     assert pool.refill_count >= 1
+    assert float(motion_cmd.metrics["sampling_entropy"].mean().item()) > 0.0
   finally:
     env.close()
+
+  # Also verify reset_pool_mode="auto" keeps adaptive MotionCommand on live GPU multinomial (0 staleness).
+  env_cfg_auto = load_env_cfg("Mjlab-Tracking-Flat-Unitree-G1")
+  env_cfg_auto.scene.num_envs = 16
+  env_cfg_auto.sim.mujoco.ccd_iterations = 50
+  env_cfg_auto.commands["motion"].motion_file = str(motion_path)  # type: ignore[attr-defined]
+  configure_fp32_exact(env_cfg_auto, enabled=True, reset_pool_mode="auto")
+  env_auto = ManagerBasedRlEnv(cfg=env_cfg_auto, device="cuda:0")
+  try:
+    assert env_auto._mega_step_graph is not None
+    mc_auto = env_auto.command_manager.get_term("motion")
+    assert getattr(mc_auto, "_async_reset_pool", None) is None
+  finally:
+    env_auto.close()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -485,7 +505,9 @@ def test_curriculum_stage_transition_recaptures_mega_graph(tmp_path):
   from mjlab.envs import ManagerBasedRlEnv
   from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
   from mjlab.tasks.registry import load_env_cfg, load_rl_cfg
-  from mjlab.utils.rollout_optimizations import configure_fp32_fast
+  from mjlab.utils.rollout_optimizations import (
+    configure_fp32_fast,
+  )
   from mjlab.utils.torch import configure_torch_backends
 
   configure_torch_backends(allow_tf32=False)
@@ -796,3 +818,63 @@ def test_env_full_step_graph_matches_stock_physics_without_root_rewind():
   finally:
     e_ref.close()
     e_mg.close()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_terrain_levels_vel_masked_step0_freeze_and_step1_exact_match():
+  """terrain_levels_vel_masked must match terrain_levels_vel on step 0 freeze & step >= 1."""
+  import mjlab.tasks  # noqa: F401
+  from mjlab.envs import ManagerBasedRlEnv
+  from mjlab.tasks.registry import load_env_cfg
+  from mjlab.tasks.velocity.mdp.curriculums import (
+    terrain_levels_vel,
+    terrain_levels_vel_masked,
+  )
+
+  cfg = load_env_cfg("Mjlab-Velocity-Rough-Unitree-G1")
+  cfg.scene.num_envs = 64
+  cfg.sim.mujoco.ccd_iterations = 50
+  cfg.seed = 42
+  env = ManagerBasedRlEnv(cfg=cfg, device="cuda:0")
+  try:
+    env.reset()
+    terrain = env.scene.terrain
+    assert terrain is not None
+    init_levels = terrain.terrain_levels.clone()
+    init_origins = terrain.env_origins.clone()
+    robot = env.scene["robot"]
+
+    disp = torch.linspace(0.0, 10.0, 64, device="cuda:0")
+    pos = env.scene.env_origins.clone()
+    pos[:, 0] += disp
+    quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device="cuda:0").expand(64, 4)
+    robot.write_root_link_pose_to_sim(torch.cat([pos, quat], dim=-1))
+    env.sim.forward()
+    mask = (torch.arange(64, device="cuda:0") % 2) == 0
+    ids = mask.nonzero(as_tuple=False).flatten()
+
+    # Step 0 must freeze terrain levels just like terrain_levels_vel.
+    env.common_step_counter = 0
+    terrain_levels_vel_masked(env, mask, command_name="twist")
+    assert torch.equal(terrain.terrain_levels, init_levels)
+
+    # Step >= 1 must match terrain_levels_vel exactly on all non-wrapping envs.
+    env.common_step_counter = 1
+    terrain_levels_vel(env, ids, command_name="twist")
+    lv_idx = terrain.terrain_levels.clone()
+    orig_idx = terrain.env_origins.clone()
+
+    terrain.terrain_levels.copy_(init_levels)
+    terrain.env_origins.copy_(init_origins)
+    robot.write_root_link_pose_to_sim(torch.cat([pos, quat], dim=-1))
+    env.sim.forward()
+    terrain_levels_vel_masked(env, mask, command_name="twist")
+    lv_msk = terrain.terrain_levels.clone()
+    orig_msk = terrain.env_origins.clone()
+
+    non_wrap = (init_levels < terrain.max_terrain_level - 1) | (~mask)
+    assert torch.equal(lv_idx[non_wrap], lv_msk[non_wrap])
+    assert torch.equal(lv_idx[~mask], lv_msk[~mask])
+    assert float((orig_idx[non_wrap] - orig_msk[non_wrap]).abs().max().item()) == 0.0
+  finally:
+    env.close()

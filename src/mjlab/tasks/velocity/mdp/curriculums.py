@@ -95,6 +95,8 @@ def terrain_levels_vel_masked(
   asset_cfg: SceneEntityCfg = _DEFAULT_SCENE_CFG,
 ) -> None:
   """Branchless CUDA-Graph-safe version of ``terrain_levels_vel``."""
+  if env.common_step_counter == 0:
+    return
   asset: Entity = env.scene[asset_cfg.name]
   terrain = env.scene.terrain
   assert terrain is not None

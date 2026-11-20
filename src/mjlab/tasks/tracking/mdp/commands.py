@@ -457,6 +457,28 @@ class MotionCommand(CommandTerm):
       soft_limits = self.robot.data.soft_joint_pos_limits
       jpos = torch.clip(batch["joint_pos"], soft_limits[:, :, 0], soft_limits[:, :, 1])
       jvel = batch["joint_vel"]
+      # Keep sampling telemetry populated even when reset states come from AsyncResetPool.
+      if self.cfg.sampling_mode == "uniform":
+        self.metrics["sampling_entropy"].fill_(1.0)
+        self.metrics["sampling_top1_prob"].fill_(1.0 / self.bin_count)
+        self.metrics["sampling_top1_bin"].fill_(0.5)
+      elif self.cfg.sampling_mode == "adaptive":
+        probs = self.bin_failed_count + self.cfg.adaptive_uniform_ratio / float(
+          self.bin_count
+        )
+        probs = torch.nn.functional.pad(
+          probs.unsqueeze(0).unsqueeze(0),
+          (0, self.cfg.adaptive_kernel_size - 1),
+          mode="replicate",
+        )
+        probs = torch.nn.functional.conv1d(probs, self.kernel.view(1, 1, -1)).view(-1)
+        probs = probs / probs.sum()
+        H = -(probs * (probs + 1e-12).log()).sum()
+        H_norm = H / math.log(self.bin_count) if self.bin_count > 1 else 1.0
+        pmax, imax = probs.max(dim=0)
+        self.metrics["sampling_entropy"].fill_(H_norm)
+        self.metrics["sampling_top1_prob"].fill_(pmax)
+        self.metrics["sampling_top1_bin"].fill_(imax.float() / self.bin_count)
     else:
       if self.cfg.sampling_mode == "start":
         new_steps = torch.zeros_like(self.time_steps)

@@ -79,16 +79,16 @@ uv run pytest tests/test_zero_sync_ppo.py tests/test_mega_step_graph.py tests/te
 
 ## Verified Benchmarks
 
-### NVIDIA RTX PRO 6000 Blackwell (95 GB, CUDA 13.2, 4,096 Envs, Strict IEEE FP32)
+### NVIDIA RTX PRO 6000 Blackwell (Workstation + Server, Strict IEEE FP32)
 
-Full analysis & interactive charts: [**Engineering Report (`docs/CPU_MEGA_GRAPH_REPORT.md`)**](docs/CPU_MEGA_GRAPH_REPORT.md) · [**Interactive HTML Dashboard (`docs/cpu_mega_graph_report.html`)**](docs/cpu_mega_graph_report.html)
+Full reports & interactive telemetry: [**Architecture Report (`docs/CPU_MEGA_GRAPH_REPORT.md`)**](docs/CPU_MEGA_GRAPH_REPORT.md) · [**420M-Step Large-Scale Validation (`docs/LARGE_SCALE_VALIDATION_REPORT.md`)**](docs/LARGE_SCALE_VALIDATION_REPORT.md) · [**Interactive HTML Dashboard (`docs/cpu_mega_graph_report.html`)**](docs/cpu_mega_graph_report.html)
 
-| Task (4,096 Envs, `allow_tf32=False`) | Baseline FPS | `fp32_exact` (`#2+#1A`) | `fp32_fast` (`#2+#1A+#1B`) | Rollout+Update CUDA Syncs |
-| :--- | :---: | :---: | :---: | :---: |
-| `Mjlab-Velocity-Flat-Unitree-G1` (20-iter ablation) | `256,556.4` | **`329,213.1`** (`+28.3%`) | **`333,026.4`** (`+29.8%`) | `464 → 5` (`-98.9%`) |
-| `Mjlab-Velocity-Flat-Unitree-G1` (40-iter sustained) | `268,991.4` | **`336,113.4`** (`+25.0%`) | **`343,706.3`** (`+27.8%`, peak **`358.7k`**) | `464 → 5` (`-98.9%`) |
-| `Mjlab-Velocity-Rough-Unitree-G1` (raycast + terrain) | `147,977.8` | **`169,245.6`** (`+14.4%`) | **`171,403.8`** (`+15.8%`) | `1,015 → 28` (`-97.2%`) |
-| `Mjlab-Tracking-Flat-Unitree-G1` (`AsyncResetPool`) | `264,364.5` | **`338,426.9`** (`+28.0%`) | **`341,665.3`** (`+29.2%`) | `454 → 6` (`-98.7%`) |
+| Benchmark (`allow_tf32=False`, Strict IEEE FP32) | Baseline FPS | `fp32_exact` (`#2+#1A`) | `fp32_fast` (`#2+#1A+#1B`) | Highlights |
+| :--- | :---: | :---: | :---: | :--- |
+| `Velocity-Flat-G1` (4,096 envs, **3 seeds × 300 iters = 265M steps**, Workstation PRO 6000) | `221,609` | **`356,505`** (`+60.9%`) | **`368,373`** (`+66.2%`, peak **`394.9k`**) | Welch `p = 0.882` (rew), `0.969` (`err_xy`) |
+| `Velocity-Flat-G1` (**16,384 envs**, Cloud PRO 6000 95 GB) | `492,645` | **`560,528`** (`+13.8%`) | **`565,079`** (`+14.7%`, peak **`568.9k`**) | Only `2.31 GB` VRAM; syncs `464 → 5` (`-98.9%`) |
+| `Velocity-Rough-G1` (4,096 envs, raycast + terrain, 2 seeds × 80 iters) | `148,755` | **`175,074`** (`+17.7%`) | **`176,875`** (`+18.9%`, peak `187.4k`) | Syncs `1,015 → 28` (`-97.2%`) |
+| `Tracking-Flat-G1` (4,096 envs, **real 131.5s LAFAN1 dance**, `reset_pool_mode="auto"`) | `276,288` | **`378,142`** (`+36.9%`) | **`387,666`** (`+40.3%`, peak `394.8k`) | `auto` live GPU adaptive: `body_pos` `0.1137 vs 0.1138` |
 
 ### Async I/O & CPU Isolation (NVIDIA L4 + Local 24-Core Workstation)
 
