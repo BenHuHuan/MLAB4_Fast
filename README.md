@@ -77,6 +77,18 @@ uv run pytest tests/test_mlab4_fast.py tests/test_mujoco_40_compat.py -q
 | Bitwise Accuracy vs Reference (`cuda:0` & CPU) | — | **`0.0` exact match** | Lossless |
 | `SdkRecoveryEnv` 5-iter Concurrent Stress (L4) | — | `9.01–23.71 ms` save + `744.2 FPS` CPU Batch Sidecar | Verified |
 
+### Tiangong3 Training Collision Optimization (Opt-In Analytic Capsules vs. CAD Meshes)
+
+Full root-cause diagnosis, Sim2Real envelope calibration, and multi-regime benchmarks: [**Tiangong3 Capsule Collision Report (`docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md`)**](docs/TIANGONG3_CAPSULE_COLLISION_REPORT.md) (`mjlab.utils.tiangong_capsule_collision.Tiangong3CapsuleCollisionCfg`).
+
+| Benchmark (`tiangong3_v2_29_head_fixed`, MuJoCo 4.0) | Original CAD `lean` | `fast` (`maxhullvert=64`) | Opt-In `capsule` (`nmesh=0`) | Gain vs. `lean` |
+| :--- | :---: | :---: | :---: | :---: |
+| `MjSpec.compile()` Hull Build (`nworld=2048`) | `1,018.99 ms` | `1,008.76 ms` | **`0.65 ms`** | **`1,568×` faster** |
+| Pure Physics Step (`2048` Mixed) / Peak VRAM | `45,377 steps/s` / `5,750 MiB` | `75,649 steps/s` / `2,989 MiB` | **`92,626 steps/s` / `1,268 MiB`** | **`2.04×` / `-78.0%` VRAM** |
+| Pure Physics Step (`4096` Ground Recovery) | CUDA OOM | `86,004 steps/s` *(tip spike)* | **`103,619 steps/s` / `2,536 MiB`** | **`+20.5%` vs. `fast`** |
+| End-to-End `SDK-A` Training (`2048 --fp32-exact`) | `22,668 FPS` (`18.10 h` / 30k) | `31,345 FPS` (`13.08 h` / 30k) | **`35,657 FPS` (`11.49 h` / 30k)** | **`+57.3%` (`-6.6 h`)** |
+| 30k `TO19` Policy Zero-Shot Stand / Recovery Parity | `96.88%` / `98.44%` | `96.88%` / `98.44%` | **`96.88%` / `98.44%`** | **`0.00%` drift (`0.273 mm` MAE)** |
+
 ---
 
 ## Acknowledgements
